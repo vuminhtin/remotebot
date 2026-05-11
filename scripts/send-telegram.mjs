@@ -141,7 +141,16 @@ export function tokenizeForEscape(text) {
   while (i < text.length) {
     if (text.startsWith('```', i)) {
       const end = text.indexOf('```', i + 3);
-      if (end === -1) break;
+      if (end === -1) {
+        // Unterminated fence: treat the rest as code so we don't silently drop
+        // content and don't leave stray backticks in text (which would either
+        // re-open Telegram's parser mid-message or get escaped weirdly).
+        flushText(i);
+        out.push({ type: 'code', value: text.slice(i) });
+        i = text.length;
+        textStart = i;
+        break;
+      }
       flushText(i);
       out.push({ type: 'code', value: text.slice(i, end + 3) });
       i = end + 3;
@@ -182,20 +191,81 @@ export function tokenizeForEscape(text) {
 
 // Non-formatting MdV2 specials. We deliberately leave `*`, `_`, `~` alone so
 // that `*bold*` / `_italic_` still render; unbalanced markers are caught by
-// the plain-text fallback at send time.
+// the preprocessing pass below (or fall through to file fallback at send time).
 const MDV2_TEXT_ESCAPE = /[.!\-()#+=|{}>\\\[\]]/g;
 const MDV2_URL_ESCAPE = /[)\\]/g;
 
+/**
+ * Best-effort CommonMark-to-MarkdownV2 normalization for plain text content.
+ * Trades exact source fidelity for a higher chance of inline Telegram render.
+ * MUST be applied per text token (never to code spans or link URLs) — caller
+ * is responsible for tokenizing first.
+ *   1. `**bold**`  -> `*bold*`         (CommonMark double-asterisk)
+ *   2. `__bold__`  -> `_bold_`         (only when NOT touching word chars on
+ *                                       both sides, so `__init__` stays literal)
+ *   3. `# Heading` -> `*Heading*`      (CommonMark heading -> bold line)
+ */
+function applyCommonMarkFixupsToText(value) {
+  value = value.replace(/\*\*([^\n*]+?)\*\*/g, '*$1*');
+  // Note: NOT rewriting `__X__` -> `_X_`. CommonMark double-underscore is
+  // ambiguous with Python dunders (`__init__`, `__main__`) and other technical
+  // identifiers. Agents almost always emit `**bold**` for bold; the few cases
+  // of `__bold__` will get the underscores escaped by the unbalanced-count
+  // pass downstream (if the count is odd) or rendered as italic-around-content
+  // (if even) — neither is catastrophic.
+  value = value.replace(/^(#{1,6})\s+(.+?)\s*$/gm, (_, _h, title) => `*${title}*`);
+  return value;
+}
+
+/**
+ * Count occurrences of `ch` across only the text tokens, skipping characters
+ * the user already escaped with `\`. An odd total means the marker is
+ * unbalanced, which causes Telegram to reject the whole message — so we'll
+ * dynamically add `ch` to the escape set.
+ */
+function countUnescapedMarkerInTextTokens(tokens, ch) {
+  let n = 0;
+  for (const t of tokens) {
+    if (t.type !== 'text') continue;
+    const s = t.value;
+    for (let i = 0; i < s.length; i++) {
+      if (s[i] === '\\') { i++; continue; }
+      if (s[i] === ch) n++;
+    }
+  }
+  return n;
+}
+
 export function escapeMarkdownV2(text) {
-  return tokenizeForEscape(text)
+  // Tokenize first, then apply CommonMark fixups only to text tokens (and link
+  // labels). This prevents fenced code blocks / inline code / URLs from being
+  // mangled by the heading or double-marker rewrites.
+  const tokens = tokenizeForEscape(text).map((t) => {
+    if (t.type === 'text') return { ...t, value: applyCommonMarkFixupsToText(t.value) };
+    if (t.type === 'link') return { ...t, label: applyCommonMarkFixupsToText(t.label) };
+    return t;
+  });
+
+  // Promote unbalanced markers to escaped characters in a single pass so we
+  // never end up with `\\*` (which Telegram renders as literal backslash plus
+  // literal asterisk). Each marker is independent: e.g. balanced `*` survives
+  // even if `_` is unbalanced and gets escaped.
+  const extraEscape = [];
+  for (const ch of ['*', '_', '~', '`']) {
+    if (countUnescapedMarkerInTextTokens(tokens, ch) % 2 === 1) extraEscape.push(ch);
+  }
+  const charClass = '.!\\-()#+=|{}>\\\\\\[\\]' + extraEscape.map((c) => '\\' + c).join('');
+  const textEscapeRe = new RegExp(`[${charClass}]`, 'g');
+
+  return tokens
     .map((t) => {
       if (t.type === 'code') return t.value;
       if (t.type === 'link') {
-        const safeLabel = t.label.replace(MDV2_TEXT_ESCAPE, (m) => '\\' + m);
+        const safeLabel = t.label.replace(textEscapeRe, (m) => '\\' + m);
         const safeUrl = t.url.replace(MDV2_URL_ESCAPE, (m) => '\\' + m);
         return `[${safeLabel}](${safeUrl})`;
       }
-      return t.value.replace(MDV2_TEXT_ESCAPE, (m) => '\\' + m);
+      return t.value.replace(textEscapeRe, (m) => '\\' + m);
     })
     .join('');
 }
