@@ -117,7 +117,7 @@ Extract `N`. This is your first tracked ID.
 
 The way you listen depends on your agent capabilities:
 
-**If your agent has a background-task tool that notifies on completion (e.g. Claude Code's `Monitor`):**
+**For Claude (Using Monitor Tool):**
 **CRITICAL: One conversation = one Monitor.** TaskStop the previous Monitor before starting a new one.
 ```bash
 Monitor({
@@ -129,8 +129,8 @@ Monitor({
 ```
 Save the task ID returned by Monitor — you need it for TaskStop later. The Monitor runs at zero AI cost in the background and notifies you when the `until` loop exits successfully.
 
-**For all other agents (Codex, Gemini, and others — Using Foreground Loop):**
-Other agents may support background tasks too, but lack a notification-on-completion mechanism, so the agent would never know when the loop matches. Run the polling loop synchronously in the foreground instead — assume the user is AFK and keep the command running until it exits with a matching reply. Do not replace this with a short poll, a timeout, or an early stop unless the user explicitly says not to wait or interrupts the turn.
+**For Codex / Gemini / other agents (Using Foreground Loop):**
+Run the polling loop synchronously in the foreground after every successful send. Assume the user is AFK and keep the command running until it exits with a matching reply. Do not replace this with a short poll, a timeout, or an early stop unless the user explicitly says not to wait or interrupts the turn.
 ```bash
 run_shell_command({
   command: "until node ../teleport/scripts/tele-listen.mjs --filter-reply-to {IDS} --offset-file ../teleport/scripts/tmp/tele-reply/{FIRST}-offset.txt; do sleep 5; done"
@@ -147,7 +147,7 @@ Process the request, then reply via: `node ../teleport/scripts/send-telegram.mjs
 **Note:** Only direct replies (to a message in your IDS) will reach your loop. Orphans are auto-reacted with 🤔 at fetch level and never cached. Stale replies (to other agents' messages) are silently ignored. No agent reasoning needed for message routing.
 
 **After handling — restart the listener (this is a loop):**
-1. If your agent uses a notify-on-completion Monitor: TaskStop the current Monitor.
+1. For Claude: TaskStop the current Monitor.
 2. Go back to **step 2**: start a new listener (Monitor or foreground loop) with the updated IDS (including the messageId M you just sent).
 3. The cycle repeats: Poll → reply arrives → process → respond → restart listener.
 
