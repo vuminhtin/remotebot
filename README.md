@@ -88,6 +88,10 @@ cp .env.example .env
 
 No `npm install`, no `npm link`, no symlink, no shell config required.
 
+## How the bot reacts to your messages
+
+When you reply to a bot message, you should see a 👍 reaction appear within seconds — that's the listener acknowledging your reply has been picked up by an agent's loop. If you instead see a 🤔 (wondering face) on your message, it means you sent a **plain message** that isn't a reply to any bot message — there's no listener waiting on it, so it will be ignored. To talk to a specific agent, long-press one of its bot messages and choose *Reply*.
+
 ## Multiple recipients
 
 `TELEGRAM_ADMIN_CHAT_ID` is treated as a **single chat ID**. If you want several people to receive the reports, create a Telegram group, add the bot + all the people to the group, and use the **group's chat ID** here. The bot will post once into the group and everyone sees it. This avoids the complexity (and message-tracking bugs) of fan-out to N individual chats.
