@@ -63,7 +63,7 @@ Add the snippet below to your project's `CLAUDE.md`, `GEMINI.md`, or `AGENTS.md`
 ````markdown
 ## Telegram Reporting
 
-**WHENEVER** the user asks to "send a Telegram report" (variants: "send tele", "send via tele", "ping me when done"…), you **MUST** read `../teleport/rules/telegram-guide.md` and follow it. Identity prefix for this agent is `<emoji> *Claude on <topic>:*` (see guide for emoji and topic rules).
+**WHENEVER** the user asks to "send a Telegram report" (variants: "send tele", "send via tele", "ping me when done"…), you **MUST** read `../teleport/rules/telegram-guide.md` and follow it. Look up your identity prefix in the guide's prefix table (this project does not duplicate it).
 
 Scripts + guide are centralized at `../teleport/` (sibling of every project). This project keeps no local copy. Invocation:
 
@@ -74,7 +74,7 @@ Scripts + guide are centralized at `../teleport/` (sibling of every project). Th
 After sending, you **MUST immediately** start the reply-listener loop described in the guide's "Listening for Replies" section. Capture the `messageId` from the send output, then start the Monitor. **MUST NOT** skip this step even if the task feels complete — the user may reply via Telegram at any time.
 ````
 
-(Adapt the identity prefix wording — `Claude reports`, `Codex reports`, `Gemini reports` — to whichever agent is reading the file.)
+The snippet is agent-agnostic — Claude, Codex, Gemini, and others each look up their own prefix in the guide. No need to fork the snippet per agent.
 
 ## First-time setup on a new machine
 

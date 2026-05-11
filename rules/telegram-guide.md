@@ -19,10 +19,17 @@ Report on the phone screen, not in a console. Keep it tight.
   ⬜ not done / skipped item
   ```
 - **Target: under 320 chars** (soft limit — overshoot is fine when needed). Don't list every diff or paste logs.
-- **Identity prefix:** `<emoji> *<Agent> on <topic>:*` — where:
-  - `<Agent>` = `Claude` / `Codex` / `Gemini`
-  - `<topic>` = short summary of the task, **max 9 words**
-  - `<emoji>` = a random emoji picked once per conversation thread (see below)
+- **Identity prefix — lookup table (centralized here so context files don't have to duplicate):**
+
+  | Agent | Prefix |
+  |---|---|
+  | Claude | `<emoji> *Claude on <topic>:*` |
+  | Codex | `*Codex here:*` |
+  | Gemini | `*Gemini here:*` |
+  | Other | `<emoji> *<Agent> on <topic>:*` (use the Claude-style by default) |
+
+  - `<topic>` = short summary of the task, **max 9 words**.
+  - `<emoji>` = a random emoji picked once per conversation thread (see "Thread emoji" below). Codex / Gemini currently do not use an emoji — keep their existing minimal form unless the user asks otherwise.
   - **Language: English by default** — `<emoji> *<Agent> on <topic>:*`. Only switch to English if the user explicitly requested English for this conversation, in which case use `<emoji> *<Agent> on <topic>:*`. Keep one language for the entire thread (do not mix VN and EN messages in the same thread).
 - **Thread emoji:** On your **first** Telegram send in a conversation, pick a random emoji unrelated to the topic (randomness reduces collisions between concurrent conversations). Use the **same emoji** for all subsequent messages in that thread (replies, follow-ups).
 - **Project code:** The script auto-prefixes `[CODE]` derived from `basename(process.cwd())`. Override with the `TELE_PROJECT_CODE` env var if needed. Agents do NOT need to add this manually.
