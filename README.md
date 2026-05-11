@@ -88,8 +88,12 @@ cp .env.example .env
 
 No `npm install`, no `npm link`, no symlink, no shell config required.
 
+## Multiple recipients
+
+`TELEGRAM_ADMIN_CHAT_IDS` is treated as a **single chat ID**. If you want several people to receive the reports, create a Telegram group, add the bot + all the people to the group, and use the **group's chat ID** here. The bot will post once into the group and everyone sees it. This avoids the complexity (and message-tracking bugs) of fan-out to N individual chats.
+
 ## Requirements
 
 - `node` on `PATH` (the scripts use Node's built-in fetch, fs, etc. — no dependencies).
 - Every project that uses Teleport must sit as a sibling of `teleport/`.
-- One Telegram bot, one chat (admin), one shared `.env`.
+- One Telegram bot, one chat (single user or a group), one shared `.env`.
