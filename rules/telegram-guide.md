@@ -1,6 +1,6 @@
 # Telegram Reporting Guide
 
-> **Path convention:** all paths in this guide are relative to the *calling project root*. Convention: `teleport/` is a sibling folder of every project (e.g. `~/Projects/md/`, `~/Projects/teleport/`, `~/Projects/tea_game/`). Agents always invoke with `cwd = project root` and refer to `../teleport/...`. No hardcoded absolute paths anywhere.
+> **Path convention:** all paths in this guide are relative to the *calling project root*. Convention: `teleport/` is a sibling folder of every project (e.g. `~/Projects/ProjectA/`, `~/Projects/teleport/`, `~/Projects/ProjectB/`). Agents always invoke with `cwd = project root` and refer to `../teleport/...`. No hardcoded absolute paths anywhere.
 
 Use `node ../teleport/scripts/send-telegram.mjs` (centralized — same script for all projects on this machine) to send messages or files to admins listed in `../teleport/.env`. PROJECT_CODE prefix is auto-derived from `basename(cwd)` so the agent gets the right `[PROJECT]` tag without per-project config.
 
@@ -27,9 +27,9 @@ Report on the phone screen, not in a console. Keep it tight.
 - **Thread emoji:** On your **first** Telegram send in a conversation, pick a random emoji unrelated to the topic (randomness reduces collisions between concurrent conversations). Use the **same emoji** for all subsequent messages in that thread (replies, follow-ups).
 - **Project code:** The script auto-prefixes `[CODE]` derived from `basename(process.cwd())`. Override with the `TELE_PROJECT_CODE` env var if needed. Agents do NOT need to add this manually.
 
-Example (with project code `TEA`):
+Example (with project code `ProjectA`):
 ```
-[TEA] 🦊 *Claude on telegram loop isolation:*
+[ProjectA] 🦊 *Claude on telegram loop isolation:*
 ✅ split telegram-guide
 ✅ add task-list convention
 ⬜ migrate AGENTS.md (next session)

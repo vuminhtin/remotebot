@@ -27,8 +27,8 @@ All paths use `../teleport/...`, relative to the *calling project root*. Convent
 ```
 ~/Projects/
 ├── teleport/
-├── md/
-├── tea_game/
+├── ProjectA/
+├── ProjectB/
 └── <other-project>/
 ```
 
@@ -37,7 +37,7 @@ Agents always invoke with `cwd = project root` and refer to `../teleport/...`. T
 ## Usage
 
 ```bash
-# Send (from project root, e.g. ~/Projects/md/)
+# Send (from project root, e.g. ~/Projects/ProjectA/)
 node ../teleport/scripts/send-telegram.mjs "<message>"
 
 # Listen (from project root)
