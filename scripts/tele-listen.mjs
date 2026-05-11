@@ -294,7 +294,7 @@ async function main() {
   const envFromFile = loadEnvFromFile(ENV_FILE);
   const token = process.env.REPORT_BOT_TOKEN || envFromFile.REPORT_BOT_TOKEN;
   const adminIds = parseAdminChatIds(
-    process.env.TELEGRAM_ADMIN_CHAT_IDS || envFromFile.TELEGRAM_ADMIN_CHAT_IDS,
+    process.env.TELEGRAM_ADMIN_CHAT_ID || envFromFile.TELEGRAM_ADMIN_CHAT_ID,
   );
 
   if (!token) {

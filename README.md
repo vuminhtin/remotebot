@@ -10,7 +10,7 @@ When multiple projects on the same machine share one bot token but each holds it
 
 ```
 ~/Projects/teleport/
-├── .env                  ← REPORT_BOT_TOKEN + TELEGRAM_ADMIN_CHAT_IDS (shared by all projects)
+├── .env                  ← REPORT_BOT_TOKEN + TELEGRAM_ADMIN_CHAT_ID (shared by all projects)
 ├── rules/
 │   └── telegram-guide.md ← canonical guide every agent reads
 ├── scripts/
@@ -83,14 +83,14 @@ cd ~/Projects
 git clone <teleport-repo-url> teleport
 cd teleport
 cp .env.example .env
-# Edit .env: fill in REPORT_BOT_TOKEN and TELEGRAM_ADMIN_CHAT_IDS
+# Edit .env: fill in REPORT_BOT_TOKEN and TELEGRAM_ADMIN_CHAT_ID
 ```
 
 No `npm install`, no `npm link`, no symlink, no shell config required.
 
 ## Multiple recipients
 
-`TELEGRAM_ADMIN_CHAT_IDS` is treated as a **single chat ID**. If you want several people to receive the reports, create a Telegram group, add the bot + all the people to the group, and use the **group's chat ID** here. The bot will post once into the group and everyone sees it. This avoids the complexity (and message-tracking bugs) of fan-out to N individual chats.
+`TELEGRAM_ADMIN_CHAT_ID` is treated as a **single chat ID**. If you want several people to receive the reports, create a Telegram group, add the bot + all the people to the group, and use the **group's chat ID** here. The bot will post once into the group and everyone sees it. This avoids the complexity (and message-tracking bugs) of fan-out to N individual chats.
 
 ## Requirements
 

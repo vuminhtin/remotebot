@@ -366,7 +366,7 @@ async function main() {
     path.basename(process.cwd()) ||
     '';
   const adminIds = parseAdminChatIds(
-    process.env.TELEGRAM_ADMIN_CHAT_IDS || envFromFile.TELEGRAM_ADMIN_CHAT_IDS,
+    process.env.TELEGRAM_ADMIN_CHAT_ID || envFromFile.TELEGRAM_ADMIN_CHAT_ID,
   );
 
   if (!token) {
@@ -374,7 +374,7 @@ async function main() {
     process.exit(1);
   }
   if (adminIds.length === 0) {
-    console.error('Missing TELEGRAM_ADMIN_CHAT_IDS in .env or process env.');
+    console.error('Missing TELEGRAM_ADMIN_CHAT_ID in .env or process env.');
     process.exit(1);
   }
 
