@@ -49,7 +49,12 @@ export function readOffset(offsetFile = DEFAULT_OFFSET_FILE) {
 export function writeOffset(updateId, offsetFile = DEFAULT_OFFSET_FILE) {
   const dir = path.dirname(offsetFile);
   fs.mkdirSync(dir, { recursive: true });
-  fs.writeFileSync(offsetFile, String(updateId + 1), 'utf8');
+  // Atomic write: temp + rename. A naked writeFileSync risks a torn/empty file
+  // if the process dies mid-write; the next reader would see 0 and (under the
+  // new-loop init path in resolveStartOffset) replay every still-cached update.
+  const tmp = `${offsetFile}.${process.pid}.${Date.now()}.tmp`;
+  fs.writeFileSync(tmp, String(updateId + 1), 'utf8');
+  fs.renameSync(tmp, offsetFile);
 }
 
 export async function fetchUpdates(token, offset) {
@@ -161,20 +166,59 @@ export function collectMessagesToProcess(updates, adminIds, filterReplyTo) {
 }
 
 /**
- * Resolve the start offset for a loop: use the per-loop file if it exists,
- * otherwise fall back to the global offset so new loops don't re-read old history.
- * When falling back to global, immediately writes the value to the per-loop file so
- * concurrent loops advancing global cannot skip our update window on future iterations.
+ * Resolve the start offset for a loop.
+ *
+ * - Existing loop (per-loop file > 0): use its own offset (it has been advancing
+ *   itself; never roll back).
+ * - New loop (per-loop file missing or 0): initialize from min(cache, global).
+ *   We can't simply inherit globalOffset because another loop may have already
+ *   advanced it past updates still sitting in our shared cache that the new
+ *   loop needs to see (its filter may match them). Starting from the oldest
+ *   cached update_id guarantees a new loop reads every update currently
+ *   buffered locally, even ones already "consumed" by other loops' offset
+ *   advances. Cache pruning keeps this bounded (last 500 updates).
  */
-export function resolveStartOffset(offsetFile, globalOffsetFile = GLOBAL_OFFSET_FILE) {
+export function resolveStartOffset(
+  offsetFile,
+  globalOffsetFile = GLOBAL_OFFSET_FILE,
+  cacheFile = UPDATES_CACHE_FILE,
+) {
   const perLoop = readOffset(offsetFile);
   if (perLoop > 0) return perLoop;
+
   const globalOffset = readOffset(globalOffsetFile);
-  if (globalOffset > 0) {
-    fs.mkdirSync(path.dirname(offsetFile), { recursive: true });
-    fs.writeFileSync(offsetFile, String(globalOffset), 'utf8');
+  let startOffset = globalOffset;
+
+  // If the cache has entries older than globalOffset, prefer the oldest cached
+  // update_id so we don't miss updates that other loops have already pulled in.
+  //
+  // Known limitation: the cache is shared across all conversations on this bot.
+  // If the caller's filter happens to match an old cached reply (e.g. resuming
+  // an older conversation whose IDS list still contains messageIds replied to
+  // long ago), that reply will be re-surfaced and 👍-reacted again. Telegram's
+  // setMessageReaction is idempotent so admin-side this is harmless; redundant
+  // work only. A future fix can persist a per-loop "highest update_id ever
+  // processed" set instead of relying on a single offset.
+  const cache = readCache(cacheFile);
+  if (cache.length > 0) {
+    // Use reduce instead of Math.min(...spread) to avoid call-stack limits if
+    // the cache cap is ever raised above the JS argument limit.
+    const minCached = cache.reduce(
+      (m, u) => (u.update_id < m ? u.update_id : m),
+      Infinity,
+    );
+    if (Number.isFinite(minCached) && minCached > 0 && (startOffset === 0 || minCached < startOffset)) {
+      startOffset = minCached;
+    }
   }
-  return globalOffset;
+
+  if (startOffset > 0) {
+    fs.mkdirSync(path.dirname(offsetFile), { recursive: true });
+    const tmp = `${offsetFile}.${process.pid}.${Date.now()}.init.tmp`;
+    fs.writeFileSync(tmp, String(startOffset), 'utf8');
+    fs.renameSync(tmp, offsetFile);
+  }
+  return startOffset;
 }
 
 

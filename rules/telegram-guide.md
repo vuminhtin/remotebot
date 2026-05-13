@@ -74,11 +74,14 @@ node ../teleport/scripts/send-telegram.mjs --file <path> "caption (optional)"
 ```
 
 ## Markdown
-Write naturally. The script auto-escapes MarkdownV2 special chars (see `escapeMarkdownV2` in the script for the full set) while preserving `*bold*`, `_italic_`, `` `code` ``, `[label](url)`, and fenced code blocks. Length > 4000 chars auto-splits at `\n\n`.
+Write naturally. The script auto-escapes MarkdownV2 special chars (see `escapeMarkdownV2` in the script for the full set) while preserving `*bold*`, `_italic_`, `` `code` ``, `[label](url)`, and fenced code blocks.
+
+## Long messages (>4000 chars)
+The script auto-sends as a single `.md` file attachment with the first line as caption — it does NOT split into multiple Telegram messages. This keeps the reply model simple: one send always produces one messageId, so admin replies to that single message always match the listener's filter. Log shows `(long-message → .md file)`.
 
 ## Failure handling
 - **Non-zero exit:** network/auth failure → MUST report the failure to the user. Do not silently treat it as sent.
-- **Markdown reject:** the script auto-falls-back by sending the content as a `.md` attachment with the first line of the message as caption (so the admin sees the thread emoji + agent identity). Log shows `(markdown-file fallback)`. No retry needed.
+- **Markdown reject:** the script auto-falls-back by sending the content as a `.md` attachment with the first line of the message as caption (so the admin sees the thread emoji + agent identity). Log shows `(markdown-parse-error → .md file)`. No retry needed.
 
 ## Reliability features
 
@@ -92,6 +95,8 @@ Every successful `node ../teleport/scripts/send-telegram.mjs` call auto-appends 
 3. Releases lock. Each loop then filters from the local cache using its own per-loop offset.
 
 This eliminates **offset stomping** — previously, concurrent loops calling `getUpdates` with different offsets caused Telegram to discard updates meant for other loops.
+
+**New-loop initialization (post-fix):** When a loop runs for the first time (per-loop offset file missing), it inherits `min(oldest cached update_id, globalOffset)` rather than `globalOffset` alone. Otherwise, if loop A has already fetched updates B's filter cares about and advanced `globalOffset` past them, a freshly-starting B would init too high and miss those still-buffered updates. Cache pruning (last 500 updates) keeps this bounded.
 
 ### Auto-react 👍
 When `tele-listen` finds a message to process, it immediately reacts with 👍 via `setMessageReaction`. The admin sees instant acknowledgment without waiting for the agent to finish processing.
@@ -108,11 +113,17 @@ After every successful `node ../teleport/scripts/send-telegram.mjs` send, you **
 
 ### Step 1 — Capture the messageId
 
-The send command prints `(messageId: N)` in its output, e.g.:
+The send command always prints a single messageId in its output, regardless of length:
 ```
 [send-telegram] sent to 123456789 (messageId: 5821)
 ```
 Extract `N`. This is your first tracked ID.
+
+If text exceeds Telegram's per-message text limit (4096 chars; script triggers at 4000 to leave MarkdownV2 escape headroom), the script auto-falls-back to sending the content as a single `.md` file attachment with the first line as caption. You'll see:
+```
+[send-telegram] sent to 123456789 (long-message → .md file, messageId: 5821)
+```
+Still **one messageId** — chunking has been removed in favor of file delivery to keep the reply-tracking model simple (one send = one ID = one reply target).
 
 **State to track** (held in agent memory — no prompt template needed):
 - `IDS` = comma-separated list of ALL messageIds you have sent in this conversation (grows as you respond)
@@ -125,16 +136,31 @@ Extract `N`. This is your first tracked ID.
 The way you listen depends on your agent capabilities:
 
 **For Claude (Using Monitor Tool):**
-**CRITICAL: One conversation = one Monitor.** TaskStop the previous Monitor before starting a new one.
+
+> **🚨 ONE CONVERSATION = ONE MONITOR. ALWAYS.**
+> Every send-telegram requires starting a fresh Monitor with the updated IDS. If a previous Monitor is still running, you MUST `TaskStop` it FIRST. Two Monitors in the same conversation is a bug — it leaks background tasks and confuses the user.
+
+**Canonical pattern (use this EVERY send, no exceptions):**
+
+Track `LAST_MONITOR_ID` across the conversation (the task ID returned by your most recent `Monitor()` call; empty before the first send).
+
 ```bash
+# Step A — if you have a previous Monitor from this conversation, stop it:
+TaskStop(task_id: {LAST_MONITOR_ID})   # skip on the very first send
+
+# Step B — start the new Monitor with updated IDS:
 Monitor({
   command: "until node ../teleport/scripts/tele-listen.mjs --filter-reply-to {IDS} --offset-file ../teleport/scripts/tmp/tele-reply/{FIRST}-offset.txt; do sleep 20; done",
   timeout_ms: 300000,
   persistent: true,
   description: "Telegram reply to messageId {LAST}"
 })
+# → save the returned task ID as the new LAST_MONITOR_ID for the next cycle
 ```
-Save the task ID returned by Monitor — you need it for TaskStop later. The Monitor runs at zero AI cost in the background and notifies you when the `until` loop exits successfully.
+
+**Self-check before EVERY `Monitor()` call:** "Did I `TaskStop` the previous Monitor in this turn?" If you can't recall starting one, you're on the first send and can skip. Otherwise, `TaskStop` it now — don't start two.
+
+The Monitor runs at zero AI cost in the background and notifies you when the `until` loop exits successfully.
 
 **For Codex / Gemini / other agents (Using Foreground Loop):**
 Run the polling loop synchronously in the foreground after every successful send. Assume the user is AFK and keep the command running until it exits with a matching reply. Do not replace this with a short poll, a timeout, or an early stop unless the user explicitly says not to wait or interrupts the turn.
@@ -154,9 +180,10 @@ Process the request, then reply via: `node ../teleport/scripts/send-telegram.mjs
 **Note:** Only direct replies (to a message in your IDS) will reach your loop. Orphans are auto-reacted with 🤔 at fetch level and never cached. Stale replies (to other agents' messages) are silently ignored. No agent reasoning needed for message routing.
 
 **After handling — restart the listener (this is a loop):**
-1. For Claude: TaskStop the current Monitor.
-2. Go back to **step 2**: start a new listener (Monitor or foreground loop) with the updated IDS (including the messageId M you just sent).
-3. The cycle repeats: Poll → reply arrives → process → respond → restart listener.
+1. Restart with the updated IDS (now including the messageId M you just sent):
+   - **Claude:** apply the canonical pattern in step 2 — `TaskStop` the previous Monitor, then start a new `Monitor()`. Never have two Monitors live in the same conversation.
+   - **Codex / Gemini / other agents:** start a new foreground loop with the updated IDS (the previous foreground loop has already exited when it caught the reply, so there's nothing to stop — just relaunch).
+2. The cycle repeats: Poll → reply arrives → process → respond → restart listener.
 
 The prompt file path changes as IDS grows (it includes the filter key), so always extract the path from the notification rather than hardcoding it.
 
@@ -167,7 +194,7 @@ The prompt file path changes as IDS grows (it includes the filter key), so alway
 - **Orphan auto-react 🤔**: orphan messages (no reply target) are reacted with 🤔 and excluded from cache at fetch time. Agents never see them.
 - **IDS grows monotonically**: every message you send gets appended. `--filter-reply-to IDS` matches replies to ANY of them — admin can reply to any message in the thread.
 - **Strict isolation**: each loop only processes direct replies to its IDS. No orphan fallback, no stale reply capture. Cross-agent contamination is impossible at the script level.
-- **Duplicate safety**: if a Monitor fires for a reply that was already processed (e.g. after context compaction), the prompt file will already be deleted — treat as no-op.
+- **Duplicate safety (partial)**: if a Monitor fires *while* the previous prompt file still exists, `tele-listen` skips (it sees the file and exits). But the script does not maintain a "processed update_id" ledger, so an update that was already consumed, replied to, and had its prompt file deleted *can* surface again if the per-loop offset is rewound (e.g. new-loop init re-reading shared cache, or manual offset-file deletion). Agents should be defensive: if you receive a notification for a reply that looks like one you already handled, double-check before re-replying.
 
 ## Rare flags
 - `--raw` — skip auto-escape (caller already escaped MarkdownV2).

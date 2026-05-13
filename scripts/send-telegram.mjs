@@ -388,18 +388,43 @@ export async function sendTextChunk(token, chatId, rawChunk, { raw, plain, reply
 }
 
 async function sendTextToAdmin(token, chatId, text, opts) {
-  const chunks = chunkMessage(text);
-  let usedFallback = false;
-  let firstMessageId;
-  const allMessageIds = [];
-  for (let i = 0; i < chunks.length; i++) {
-    const chunkOpts = i === 0 ? opts : { ...opts, replyTo: null };
-    const { fallback, messageId } = await sendTextChunk(token, chatId, chunks[i], chunkOpts);
-    if (fallback) usedFallback = true;
-    if (i === 0) firstMessageId = messageId;
-    if (messageId) allMessageIds.push(messageId);
+  // Long-message policy: if text exceeds the single-message limit, send as a
+  // single .md file attachment instead of splitting into multiple Telegram
+  // messages. Rationale: chunked sends give each chunk its own messageId, so
+  // a user reply to any chunk other than the first won't match the agent's
+  // filter (one bug we hit in practice). One file = one messageId = simple.
+  if (text.length > MESSAGE_CHUNK_LIMIT) {
+    let tmpPath;
+    try {
+      tmpPath = createTempMarkdownFile(text);
+    } catch (e) {
+      throw new Error(`long-message file fallback failed to write tmp file: ${e instanceof Error ? e.message : String(e)}`);
+    }
+    try {
+      const firstLine = text.split('\n')[0].slice(0, 100);
+      const res = await postSendDocument(token, chatId, tmpPath, firstLine, null, opts.replyTo ?? null);
+      if (!res.ok) throw new Error(`long-message file fallback upload failed: ${res.description ?? `HTTP ${res.status}`}`);
+      if (!res.messageId) throw new Error(`long-message file fallback: Telegram returned ok but no message_id — refusing to claim success`);
+      return {
+        chunks: 1,
+        fallback: 'auto-file',
+        messageId: res.messageId,
+        allMessageIds: [res.messageId],
+      };
+    } finally {
+      try { fs.unlinkSync(tmpPath); } catch {}
+    }
   }
-  return { chunks: chunks.length, fallback: usedFallback, messageId: firstMessageId, allMessageIds };
+
+  // Short message: single sendMessage with markdown parsing (and per-chunk
+  // fallback to .md file if Telegram rejects the parse).
+  const { fallback, messageId } = await sendTextChunk(token, chatId, text, opts);
+  return {
+    chunks: 1,
+    fallback: fallback ? 'parse-error-file' : false,
+    messageId,
+    allMessageIds: messageId ? [messageId] : [],
+  };
 }
 
 async function sendDocumentToAdmin(token, chatId, filePath, caption, opts) {
@@ -524,11 +549,11 @@ async function main() {
   let failures = 0;
   for (const chatId of adminIds) {
     try {
-      const { chunks, fallback, messageId, allMessageIds } = await sendTextToAdmin(token, chatId, message, opts);
+      const { fallback, messageId, allMessageIds } = await sendTextToAdmin(token, chatId, message, opts);
       for (const mid of allMessageIds) appendToSentRegistry(mid, chatId);
       const parts = [];
-      if (chunks > 1) parts.push(`${chunks} chunks`);
-      if (fallback) parts.push('markdown-file fallback');
+      if (fallback === 'auto-file') parts.push('long-message → .md file');
+      else if (fallback === 'parse-error-file') parts.push('markdown-parse-error → .md file');
       if (messageId) parts.push(`messageId: ${messageId}`);
       const note = parts.length > 0 ? ` (${parts.join(', ')})` : '';
       console.log(`[send-telegram] sent to ${chatId}${note}`);
