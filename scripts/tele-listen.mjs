@@ -376,18 +376,37 @@ export function isProcessAlive(pid) {
  */
 export function getProcessStartTime(pid) {
   if (!Number.isFinite(pid) || pid <= 0) return null;
+
+  // Linux fast path: /proc/<pid>/stat field 22 is starttime in clock ticks
+  // since boot. Stable per process, equality-comparable, no subprocess. Works
+  // on every Linux (incl. Alpine/BusyBox where `ps -o lstart=` is missing).
+  // The `comm` field (parenthesized) may contain spaces/parens, so we slice
+  // after the LAST ')' to avoid mis-splitting.
   try {
-    // LC_ALL=C pins month/day names so writer-vs-reader locale skew can't
-    // make a live process look like a different one. `ps -o lstart=` is on
-    // macOS and GNU ps; BusyBox / Alpine ps lacks it (returns empty → null,
-    // and isLiveEntry falls back to plain liveness on null startTime).
+    const stat = fs.readFileSync(`/proc/${pid}/stat`, 'utf8');
+    const afterComm = stat.slice(stat.lastIndexOf(')') + 2);
+    // After ')<sp>', fields begin at index 0 = state (field 3 in 1-indexed).
+    // We want field 22 = index 22 - 3 = 19.
+    const starttime = afterComm.split(' ')[19];
+    if (starttime && /^\d+$/.test(starttime)) return `proc:${starttime}`;
+  } catch {
+    // /proc not available (macOS, restricted env) — fall through to ps.
+  }
+
+  // macOS + most GNU/Linux: `ps -o lstart=` is the portable identifier.
+  // LC_ALL=C pins month/day names so writer-vs-reader locale skew can't
+  // make a live process look like a different one. Tag the return value so
+  // a proc-flavored startTime never accidentally compares equal to a
+  // ps-flavored one (different format, same machine — paranoia, since one
+  // host normally produces one flavor).
+  try {
     const out = execFileSync('ps', ['-o', 'lstart=', '-p', String(pid)], {
       encoding: 'utf8',
       stdio: ['ignore', 'pipe', 'ignore'],
       timeout: 500,
       env: { ...process.env, LC_ALL: 'C' },
     }).trim();
-    return out || null;
+    return out ? `ps:${out}` : null;
   } catch {
     return null;
   }
