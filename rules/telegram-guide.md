@@ -91,7 +91,7 @@ Every successful `node ../teleport/scripts/send-telegram.mjs` call auto-appends 
 ### Local Update Cache
 `tele-listen` no longer calls Telegram's `getUpdates` directly per-loop. Instead:
 1. Acquires a file lock (`poll.lock`) — only one process polls at a time.
-2. Fetches from Telegram API, partitions orphans (reacted with 🤔 outside lock), appends non-orphan updates to `updates-cache.jsonl`.
+2. Fetches from Telegram API, partitions orphans (reacted with 💔 outside lock), appends non-orphan updates to `updates-cache.jsonl`.
 3. Releases lock. Each loop then filters from the local cache using its own per-loop offset.
 
 This eliminates **offset stomping** — previously, concurrent loops calling `getUpdates` with different offsets caused Telegram to discard updates meant for other loops.
@@ -101,11 +101,24 @@ This eliminates **offset stomping** — previously, concurrent loops calling `ge
 ### Auto-react 👍
 When `tele-listen` finds a message to process, it immediately reacts with 👍 via `setMessageReaction`. The admin sees instant acknowledgment without waiting for the agent to finish processing.
 
-### Orphan Auto-react 🤔
-During the centralized fetch, orphan messages (admin messages with no reply target) are automatically reacted with 🤔 and excluded from the cache. Agents never see orphans — no reasoning required. Admin must reply to a specific bot message to reach the owning agent's loop.
+### Orphan Auto-react 💔
+During the centralized fetch, orphan messages (admin messages with no reply target) are automatically reacted with 💔 and excluded from the cache. Agents never see orphans — no reasoning required. Admin must reply to a specific bot message to reach the owning agent's loop.
 
 ### Isolation
 Each loop only processes **direct matches** — replies to messages in its `--filter-reply-to` IDS. Stale replies (replies to messages from other agents/conversations) are ignored. This prevents cross-agent contamination without relying on agent reasoning.
+
+### Auto-supersede (Claude / Monitor users only)
+**Scope:** this is a safety net for **Claude with the Monitor tool**, where the agent can start a new Monitor while a previous one is still running — that's the only setup that produces orphan listeners. Codex / Gemini / other agents using the foreground-loop pattern don't have this problem: their loop blocks the agent's tool call, so they can't start a second listener until the first returns. They neither need nor are harmed by what's below; this section is informational for them.
+
+Every `tele-listen` invocation registers `{pid, filter, offsetFile}` (pid = the long-lived bash wrapper, i.e. `process.ppid`) into `listener-registry.jsonl` and prunes dead entries. Before polling, it checks the registry: if **another live listener has a strict-superset filter**, the current listener exits cleanly (so its outer `until …; do sleep 20; done` wrapper also exits and the orphaned Monitor goes away).
+
+Why "strict superset": when a Claude conversation moves to a new Monitor, the agent always appends new messageIds — the new filter is a strict superset of the old. So an older listener detects a newer one and self-exits within at most one poll cycle (~20s) of the newer one's first run.
+
+Cross-conversation safety is by construction: two conversations have disjoint `messageId` sets (each bot-sent messageId belongs to exactly one conversation), so no cross-conversation pair satisfies strict-superset. A newer Monitor for conversation B never accidentally supersedes conversation A's listener.
+
+**This does NOT remove the agent's obligation to TaskStop the previous Monitor.** TaskStop ends the harness-level task immediately and cleanly; auto-supersede is a safety net for the case where the agent forgets (catches up within ~20s). Belt and suspenders.
+
+**Failure mode this does NOT cover:** if the agent calls `TaskStop` *without* starting a new Monitor, the OS-level bash wrapper keeps spinning (TaskStop does not SIGTERM children). With no newer listener to detect, supersede never fires. Mitigation: always either start a new Monitor after TaskStop, or `pkill -f tele-listen` manually. A future change may add an idle-timeout exit.
 
 ## Listening for Replies (MUST follow after every successful send)
 
@@ -189,7 +202,7 @@ When the loop succeeds, its output contains `prompt written to <path>`. Parse th
 
 Process the request, then reply via: `node ../teleport/scripts/send-telegram.mjs --reply-to <prompt.messageId> "E <response summary>"`. Capture new messageId M, append M to IDS.
 
-**Note:** Only direct replies (to a message in your IDS) will reach your loop. Orphans are auto-reacted with 🤔 at fetch level and never cached. Stale replies (to other agents' messages) are silently ignored. No agent reasoning needed for message routing.
+**Note:** Only direct replies (to a message in your IDS) will reach your loop. Orphans are auto-reacted with 💔 at fetch level and never cached. Stale replies (to other agents' messages) are silently ignored. No agent reasoning needed for message routing.
 
 **After handling — restart the listener (this is a loop):**
 1. Restart with the updated IDS (now including the messageId M you just sent):
@@ -203,7 +216,7 @@ The prompt file path changes as IDS grows (it includes the filter key), so alway
 - **Local cache prevents offset stomping**: all loops read from `updates-cache.jsonl`, only one process calls `getUpdates` at a time via file lock.
 - **Sent registry** (`sent-registry.jsonl`): persistent record of all bot messages.
 - **Auto-react 👍**: admin sees instant ack when message is picked up, before processing completes.
-- **Orphan auto-react 🤔**: orphan messages (no reply target) are reacted with 🤔 and excluded from cache at fetch time. Agents never see them.
+- **Orphan auto-react 💔**: orphan messages (no reply target) are reacted with 💔 and excluded from cache at fetch time. Agents never see them.
 - **IDS grows monotonically**: every message you send gets appended. `--filter-reply-to IDS` matches replies to ANY of them — admin can reply to any message in the thread.
 - **Strict isolation**: each loop only processes direct replies to its IDS. No orphan fallback, no stale reply capture. Cross-agent contamination is impossible at the script level.
 - **Duplicate safety (partial)**: if a Monitor fires *while* the previous prompt file still exists, `tele-listen` skips (it sees the file and exits). But the script does not maintain a "processed update_id" ledger, so an update that was already consumed, replied to, and had its prompt file deleted *can* surface again if the per-loop offset is rewound (e.g. new-loop init re-reading shared cache, or manual offset-file deletion). Agents should be defensive: if you receive a notification for a reply that looks like one you already handled, double-check before re-replying.

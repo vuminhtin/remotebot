@@ -17,6 +17,7 @@ export const DEFAULT_PROMPT_FILE = path.join(DEFAULT_TMP_DIR, 'prompt.json');
 export const DEFAULT_PROMPT_PROCESSING_FILE = path.join(DEFAULT_TMP_DIR, 'prompt.processing.json');
 export const UPDATES_CACHE_FILE = path.join(DEFAULT_TMP_DIR, 'updates-cache.jsonl');
 export const POLL_LOCK_FILE = path.join(DEFAULT_TMP_DIR, 'poll.lock');
+export const REGISTRY_FILE = path.join(DEFAULT_TMP_DIR, 'listener-registry.jsonl');
 const LOCK_STALE_MS = 30_000;
 
 export function filterKey(filterReplyTo) {
@@ -308,7 +309,7 @@ export async function reactToOrphans(token, orphanEntries) {
   const reacted = [];
   for (const entry of orphanEntries) {
     try {
-      const { ok, description } = await postReaction(token, String(entry.msg.chat.id), entry.msg.message_id, '🤔');
+      const { ok, description } = await postReaction(token, String(entry.msg.chat.id), entry.msg.message_id, '💔');
       if (ok) reacted.push(entry);
       else console.error(`[tele-listen] orphan react rejected for ${entry.msg.message_id}: ${description}`);
     } catch (e) {
@@ -335,6 +336,80 @@ export async function reactToMessages(token, messages) {
     }
     if (!success) console.error(`[tele-listen] react gave up for ${msgId} after 2 attempts`);
   }
+}
+
+// Listener registry: lets a listener detect that another listener with a strictly
+// broader filter (= the same conversation's newer Monitor) is alive, and self-exit.
+// Cross-conversation safe: different conversations have disjoint messageId sets, so
+// "strict superset" can only match within one conversation. See telegram-guide.md.
+
+export function isProcessAlive(pid) {
+  if (!Number.isFinite(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (e) {
+    // EPERM means the process exists but we lack permission to signal it — still alive.
+    return e && e.code === 'EPERM';
+  }
+}
+
+export function readRegistry(file = REGISTRY_FILE) {
+  let raw;
+  try { raw = fs.readFileSync(file, 'utf8'); } catch { return []; }
+  const out = [];
+  for (const line of raw.trim().split('\n')) {
+    if (!line) continue;
+    try { out.push(JSON.parse(line)); } catch {}
+  }
+  return out;
+}
+
+function writeRegistry(entries, file = REGISTRY_FILE) {
+  if (entries.length === 0) {
+    try { fs.unlinkSync(file); } catch {}
+    return;
+  }
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  const tmp = file + `.${Date.now()}.${process.pid}.tmp`;
+  fs.writeFileSync(tmp, entries.map((e) => JSON.stringify(e)).join('\n') + '\n', 'utf8');
+  fs.renameSync(tmp, file);
+}
+
+/**
+ * Refresh registry: drop dead entries + dedupe by pid + add/update mine.
+ * Called once per tele-listen invocation. Returns the live list (incl. mine).
+ */
+export function refreshRegistry({ pid, filter, offsetFile, file = REGISTRY_FILE, now = Date.now() }) {
+  const all = readRegistry(file);
+  const live = all.filter((e) => e.pid !== pid && Number.isFinite(e.pid) && isProcessAlive(e.pid));
+  const mine = { pid, filter, offsetFile, startedAt: now };
+  // Preserve original startedAt if I already had an entry (same pid):
+  const existing = all.find((e) => e.pid === pid);
+  if (existing && Number.isFinite(existing.startedAt)) mine.startedAt = existing.startedAt;
+  const next = [...live, mine];
+  writeRegistry(next, file);
+  return next;
+}
+
+export function isStrictSuperset(other, mine) {
+  if (mine == null) return false; // I have no filter (catch-all) → nothing is broader than me
+  if (other == null) return true; // they have no filter (catch-all) → broader than my filtered view
+  const mineArr = Array.isArray(mine) ? mine : [mine];
+  const otherArr = Array.isArray(other) ? other : [other];
+  const mineSet = new Set(mineArr);
+  const otherSet = new Set(otherArr);
+  if (otherSet.size <= mineSet.size) return false; // must be strictly larger
+  for (const m of mineSet) if (!otherSet.has(m)) return false;
+  return true;
+}
+
+export function findSuperseder({ myPid, myFilter, registry }) {
+  for (const e of registry) {
+    if (e.pid === myPid) continue;
+    if (isStrictSuperset(e.filter, myFilter)) return e;
+  }
+  return null;
 }
 
 export function writePromptAtomic(data, promptFile = DEFAULT_PROMPT_FILE) {
@@ -364,6 +439,22 @@ async function main() {
   if (!token) {
     console.error('[tele-listen] Missing REPORT_BOT_TOKEN');
     process.exit(1);
+  }
+
+  // Registry-based supersede: if another live listener has a strict-superset
+  // filter (= the same conversation moved to a newer Monitor with broader IDS),
+  // self-exit cleanly so the outer `until ...; do sleep 20; done` loop ends and
+  // the orphaned Monitor wrapper goes away. We track by PPID — the long-lived
+  // bash wrapper that the Monitor tool spawned — not our own PID, which is
+  // short-lived (one poll per invocation).
+  const myMonitorPid = process.ppid;
+  const registry = refreshRegistry({ pid: myMonitorPid, filter: filterReplyTo, offsetFile });
+  const superseder = findSuperseder({ myPid: myMonitorPid, myFilter: filterReplyTo, registry });
+  if (superseder) {
+    console.log(
+      `[tele-listen] superseded by listener pid=${superseder.pid} with broader filter — exiting`,
+    );
+    process.exit(0);
   }
 
   const promptFile = getPromptFile(filterReplyTo);
@@ -440,7 +531,7 @@ async function main() {
     }
   }
 
-  // React 🤔 to orphans outside lock (best-effort, does not block polling)
+  // React 💔 to orphans outside lock (best-effort, does not block polling)
   if (pendingOrphans.length > 0) {
     await reactToOrphans(token, pendingOrphans);
   }
