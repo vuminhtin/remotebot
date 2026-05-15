@@ -108,11 +108,11 @@ During the centralized fetch, orphan messages (admin messages with no reply targ
 Each loop only processes **direct matches** — replies to messages in its `--filter-reply-to` IDS. Stale replies (replies to messages from other agents/conversations) are ignored. This prevents cross-agent contamination without relying on agent reasoning.
 
 ### Auto-supersede
-**Primary motivation:** safety net for **Claude with the Monitor tool**, where the agent can start a new Monitor while a previous one is still running — that's the setup that produces orphan listeners in practice. Codex / Gemini / other agents using the foreground-loop pattern can't hit this in the normal flow (their loop blocks the tool call), but the mechanism also applies to any background-launched listener loop (e.g. a developer running `until tele-listen ... ; do sleep 20; done &` from a shell).
+**Primary motivation:** safety net for **Claude with the Monitor tool**, where the agent can start a new Monitor while a previous one is still running — that's the setup that produces orphan listeners in practice. Codex / Gemini / other agents using the foreground-loop pattern can't hit this in the normal flow (their loop blocks the tool call), but the mechanism also applies to any background-launched listener loop (e.g. a developer running `until tele-listen ... ; do sleep 12; done &` from a shell).
 
 Every `tele-listen` invocation registers `{pid, filter, offsetFile, startedAt, startTime}` (pid = the long-lived bash wrapper, i.e. `process.ppid`; startTime = the wrapper's `ps lstart` snapshot, used to detect PID reuse) into `listener-registry.jsonl` under a `registry.lock`. Before polling, it checks the registry: if **another live listener has a strict-superset filter**, the current listener exits cleanly so its outer `until …; do sleep N; done` wrapper also exits.
 
-Why "strict superset": when a conversation moves to a new Monitor, the agent always appends new messageIds — the new filter is a strict superset of the old. So an older listener detects a newer one and self-exits within one to two poll cycles (~20s for Monitor, ~5s for foreground); the second cycle only matters if the newer listener loses its first registry-lock race, which is rare.
+Why "strict superset": when a conversation moves to a new Monitor, the agent always appends new messageIds — the new filter is a strict superset of the old. So an older listener detects a newer one and self-exits within one to two poll cycles (~12s for Monitor, ~5s for foreground); the second cycle only matters if the newer listener loses its first registry-lock race, which is rare.
 
 **Cross-conversation safety is by convention, not construction.** Each agent must only put bot-sent messageIds it itself sent into `--filter-reply-to`. Two such IDS sets are disjoint (each bot-sent messageId belongs to exactly one conversation), so strict-superset can only match intra-conversation. If an agent ever invokes `tele-listen` **without** `--filter-reply-to` (catch-all / debug run), it would have no filter constraint — to prevent it from wiping every legitimate filtered listener, the supersede check treats catch-all (`filter == null`) as **neither superseding nor being superseded by** anything. So a catch-all listener runs in parallel, harmlessly, and a filtered listener is never killed by an unintended catch-all.
 
@@ -179,7 +179,7 @@ TaskStop(task_id: {LAST_MONITOR_ID})   # skip on the very first send
 
 # Step B — start the new Monitor with updated IDS:
 Monitor({
-  command: "until node ../teleport/scripts/tele-listen.mjs --filter-reply-to {IDS} --offset-file ../teleport/scripts/tmp/tele-reply/{FIRST}-offset.txt; do sleep 20; done",
+  command: "until node ../teleport/scripts/tele-listen.mjs --filter-reply-to {IDS} --offset-file ../teleport/scripts/tmp/tele-reply/{FIRST}-offset.txt; do sleep 12; done",
   timeout_ms: 300000,
   persistent: true,
   description: "Telegram reply to messageId {LAST}"

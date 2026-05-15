@@ -481,7 +481,7 @@ async function acquireLockWithRetry(lockFile, { maxAttempts = 50, retryMs = 20 }
  * If lock can't be acquired (very rare), we fall back to a best-effort
  * read-only path: we still return the most recent on-disk registry so the
  * caller's supersede check works, but we don't write our own entry this round.
- * The next invocation 20s later will retry — eventual consistency.
+ * The next invocation 12s later will retry — eventual consistency.
  */
 export async function refreshRegistry({
   pid,
@@ -498,7 +498,7 @@ export async function refreshRegistry({
     // Read-only fallback: peers still see whatever was on disk last write,
     // so we can detect *being* superseded. We do NOT write our own entry
     // this cycle, which means *being detected as a superseder* by older
-    // peers is delayed by one poll. Acceptable: the next 20s poll retries.
+    // peers is delayed by one poll. Acceptable: the next 12s poll retries.
     console.error('[tele-listen] could not acquire registry lock; will retry next poll');
     return readRegistry(file);
   }
@@ -595,7 +595,7 @@ async function main() {
 
   // Registry-based supersede: if another live listener has a strict-superset
   // filter (= the same conversation moved to a newer Monitor with broader IDS),
-  // self-exit cleanly so the outer `until ...; do sleep 20; done` loop ends and
+  // self-exit cleanly so the outer `until ...; do sleep 12; done` loop ends and
   // the orphaned wrapper goes away. We track by PPID — the long-lived bash
   // wrapper — not our own PID, which is short-lived (one poll per invocation).
   //
