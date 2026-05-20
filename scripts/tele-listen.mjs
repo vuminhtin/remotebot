@@ -14,6 +14,7 @@ const TELEGRAM_API = 'https://api.telegram.org/bot';
 export const DEFAULT_TMP_DIR = path.join(__dirname, 'tmp', 'tele-reply');
 export const DEFAULT_OFFSET_FILE = path.join(DEFAULT_TMP_DIR, 'last-update-id.txt');
 export const SYSTEM_MSG_IDS_FILE = path.join(DEFAULT_TMP_DIR, 'system-msg-ids.jsonl');
+export const SYSTEM_MSG_IDS_LOCK_FILE = path.join(DEFAULT_TMP_DIR, 'system-msg-ids.lock');
 const SYSTEM_MSG_IDS_MAX = 500;
 const SYSTEM_MSG_IDS_PRUNE_THRESHOLD = SYSTEM_MSG_IDS_MAX * 2;
 
@@ -24,20 +25,31 @@ function systemMsgKey(chatId, messageId) {
   return `${chatId}:${messageId}`;
 }
 
-export function appendSystemMsgId(chatId, messageId, file = SYSTEM_MSG_IDS_FILE) {
+export async function appendSystemMsgId(chatId, messageId, file = SYSTEM_MSG_IDS_FILE) {
   fs.mkdirSync(path.dirname(file), { recursive: true });
+  // `appendFileSync` of a short line (~70 bytes) is atomic on POSIX (< PIPE_BUF),
+  // so concurrent appends from multiple listeners don't tear. The prune block
+  // below (read + slice + rename), however, is NOT atomic vs. concurrent appends
+  // — without a lock, another process's append between our read and rename gets
+  // clobbered, losing a [SYSTEM] messageId and turning a future reply-to-system
+  // into a silent drop. Serialize prune with a dedicated lock.
   fs.appendFileSync(file, JSON.stringify({ chatId: String(chatId), messageId, ts: Date.now() }) + '\n', 'utf8');
-  // Compact file when it grows past the threshold, mirroring `pruneCache`'s
-  // tmp+rename pattern. Without this the file grows unbounded — readSystemMsgIds
-  // is called every poll, so unbounded growth means unbounded read CPU too.
   try {
-    const lineCount = fs.readFileSync(file, 'utf8').split('\n').filter(Boolean).length;
-    if (lineCount > SYSTEM_MSG_IDS_PRUNE_THRESHOLD) {
+    const initialLines = fs.readFileSync(file, 'utf8').split('\n').filter(Boolean);
+    if (initialLines.length <= SYSTEM_MSG_IDS_PRUNE_THRESHOLD) return;
+    const lockHeld = await acquireLockWithRetry(SYSTEM_MSG_IDS_LOCK_FILE);
+    if (!lockHeld) return; // someone else is pruning; their write will cover us
+    try {
+      // Re-read inside the lock so we don't clobber appends that landed between
+      // our threshold check and the lock acquisition.
       const lines = fs.readFileSync(file, 'utf8').split('\n').filter(Boolean);
+      if (lines.length <= SYSTEM_MSG_IDS_MAX) return; // another process already pruned
       const kept = lines.slice(-SYSTEM_MSG_IDS_MAX);
       const tmp = file + `.${process.pid}.${Date.now()}.tmp`;
       fs.writeFileSync(tmp, kept.join('\n') + '\n', 'utf8');
       fs.renameSync(tmp, file);
+    } finally {
+      releasePollLock(SYSTEM_MSG_IDS_LOCK_FILE);
     }
   } catch (e) {
     console.error(`[tele-listen] system-msg-ids prune failed: ${e instanceof Error ? e.message : String(e)}`);
@@ -383,7 +395,7 @@ export async function reactToOrphans(token, orphanEntries, systemMsgIds = new Se
       // fetch — otherwise it would silently drop (no Monitor filter knows it).
       // Skip recording if sendTextChunk fell back to .md document (long text or
       // markdown parse error) — that .md is not a [SYSTEM] message.
-      if (res?.messageId && !res.fallback) appendSystemMsgId(chatId, res.messageId);
+      if (res?.messageId && !res.fallback) await appendSystemMsgId(chatId, res.messageId);
     } catch (e) {
       console.error(`[tele-listen] orphan reply-hint failed for ${msgId}: ${e instanceof Error ? e.message : String(e)}`);
     }
