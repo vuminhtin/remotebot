@@ -11,7 +11,7 @@ Extracted from internal tooling built for **[trumviahe.com](https://trumviahe.co
 ### 1. Clone next to your projects
 
 ```bash
-cd ~/Projects
+cd ~/Projects   # any parent folder works (e.g. ~/work, ~/code, D:\dev)
 git clone https://github.com/thith/teleport.git
 cd teleport
 cp .env.example .env
@@ -20,11 +20,13 @@ cp .env.example .env
 `teleport/` must sit as a sibling of every project that uses it:
 
 ```
-~/Projects/
+<your-parent-folder>/   # e.g. ~/Projects, ~/work, D:\dev
 ├── teleport/
 ├── ProjectA/
 └── ProjectB/
 ```
+
+The parent folder name doesn't matter — what matters is that `teleport/` is a **sibling** of your projects.
 
 ### 2. Get a bot token and your chat ID
 
