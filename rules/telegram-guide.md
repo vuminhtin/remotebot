@@ -24,12 +24,15 @@ Report on the phone screen, not in a console. Keep it tight.
   | Agent | Prefix |
   |---|---|
   | Claude | `<emoji> *Claude on <topic>:*` |
-  | Codex | `*Codex here:*` |
-  | Gemini | `*Gemini here:*` |
-  | Other | `<emoji> *<Agent> on <topic>:*` (use the Claude-style by default) |
+  | Codex | `<emoji> *Codex on <topic>:*` |
+  | Gemini | `<emoji> *Gemini on <topic>:*` |
+  | Other | `<emoji> *<Agent> on <topic>:*` |
 
+  - `<emoji>` and `<Agent>` carry **different signals** and both are required:
+    - `<emoji>` = **conversation identity** — distinguishes concurrent conversations in the same chat (e.g. user opens two parallel Claude sessions on different tasks; emojis tell them apart).
+    - `<Agent>` = **agent identity** — distinguishes Claude vs Codex vs Gemini regardless of conversation.
   - `<topic>` = short summary of the task, **max 9 words**.
-  - `<emoji>` = a random emoji picked once per conversation thread (see "Thread emoji" below). Codex / Gemini currently do not use an emoji — keep their existing minimal form unless the user asks otherwise.
+  - `<emoji>` = a random emoji picked once per conversation thread (see "Thread emoji" below). All agents must include one.
   - **Language:** Match the user's language for this conversation. Default to English if unset. Keep one language for the entire thread (do not mix languages in the same thread). The wording in the prefix table (`on <topic>`) is the English form — substitute the equivalent phrasing in the chosen language.
 - **Thread emoji:** On your **first** Telegram send in a conversation, pick a random emoji unrelated to the topic (randomness reduces collisions between concurrent conversations). Use the **same emoji** for all subsequent messages in that thread (replies, follow-ups).
 - **Project code:** The script auto-prefixes `[CODE]` derived from `basename(process.cwd())`. Override with the `TELE_PROJECT_CODE` env var if needed. Agents do NOT need to add this manually.
