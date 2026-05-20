@@ -80,16 +80,14 @@ After sending, you **MUST immediately** start the reply-listener loop described 
 
 ## How to use
 
-Just mention "Telegram" or "tele" in your request. Examples:
+Say *"tele me"* (or similar) **before** you leave the desk. Examples:
 
 - *"Ping me on Telegram when done."*
 - *"Report via Telegram and wait for instructions."*
 - *"Schedule a wakeup in 30 minutes; tele me when you wake up."*
 - *"Send a tele report after each PR you open."*
 
-The agent sends a short report, listens for your reply, and continues.
-
-**Reply reactions:** 👍 on your message means the agent is processing it. 💔 means you **forgot to reply to a bot message**, so the bot will **ignore** what you just sent. Try again — this time use Telegram's *Reply* feature on the specific bot message you want to answer.
+The agent sends a short report, listens for your reply, and continues while you're away. *If the bot reacts 💔 on your message, it means it was ignored — you sent a plain message instead of using Telegram's Reply feature.*
 
 ## Before you go away from the desk
 

@@ -4,7 +4,7 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { loadEnvFromFile, parseAdminChatIds, postReaction } from './send-telegram.mjs';
+import { loadEnvFromFile, parseAdminChatIds, postReaction, sendTextChunk } from './send-telegram.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT_DIR = path.resolve(__dirname, '..');
@@ -13,6 +13,49 @@ const TELEGRAM_API = 'https://api.telegram.org/bot';
 
 export const DEFAULT_TMP_DIR = path.join(__dirname, 'tmp', 'tele-reply');
 export const DEFAULT_OFFSET_FILE = path.join(DEFAULT_TMP_DIR, 'last-update-id.txt');
+export const SYSTEM_MSG_IDS_FILE = path.join(DEFAULT_TMP_DIR, 'system-msg-ids.jsonl');
+const SYSTEM_MSG_IDS_MAX = 500;
+const SYSTEM_MSG_IDS_PRUNE_THRESHOLD = SYSTEM_MSG_IDS_MAX * 2;
+
+// Compose the per-chat key used to look up a system message; Telegram message_id
+// is unique only within a chat, so the key must include chat_id to avoid
+// cross-chat collisions (chat A's system msg #42 vs chat B's agent msg #42).
+function systemMsgKey(chatId, messageId) {
+  return `${chatId}:${messageId}`;
+}
+
+export function appendSystemMsgId(chatId, messageId, file = SYSTEM_MSG_IDS_FILE) {
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.appendFileSync(file, JSON.stringify({ chatId: String(chatId), messageId, ts: Date.now() }) + '\n', 'utf8');
+  // Compact file when it grows past the threshold, mirroring `pruneCache`'s
+  // tmp+rename pattern. Without this the file grows unbounded — readSystemMsgIds
+  // is called every poll, so unbounded growth means unbounded read CPU too.
+  try {
+    const lineCount = fs.readFileSync(file, 'utf8').split('\n').filter(Boolean).length;
+    if (lineCount > SYSTEM_MSG_IDS_PRUNE_THRESHOLD) {
+      const lines = fs.readFileSync(file, 'utf8').split('\n').filter(Boolean);
+      const kept = lines.slice(-SYSTEM_MSG_IDS_MAX);
+      const tmp = file + `.${process.pid}.${Date.now()}.tmp`;
+      fs.writeFileSync(tmp, kept.join('\n') + '\n', 'utf8');
+      fs.renameSync(tmp, file);
+    }
+  } catch (e) {
+    console.error(`[tele-listen] system-msg-ids prune failed: ${e instanceof Error ? e.message : String(e)}`);
+  }
+}
+
+export function readSystemMsgIds(file = SYSTEM_MSG_IDS_FILE) {
+  if (!fs.existsSync(file)) return new Set();
+  const lines = fs.readFileSync(file, 'utf8').split('\n').filter(Boolean);
+  const trimmed = lines.slice(-SYSTEM_MSG_IDS_MAX);
+  return new Set(trimmed.map((l) => {
+    try {
+      const { chatId, messageId } = JSON.parse(l);
+      if (chatId == null || messageId == null) return null;
+      return systemMsgKey(chatId, messageId);
+    } catch { return null; }
+  }).filter((k) => k != null));
+}
 export const GLOBAL_OFFSET_FILE = path.join(DEFAULT_TMP_DIR, 'global-offset.txt');
 export const DEFAULT_PROMPT_FILE = path.join(DEFAULT_TMP_DIR, 'prompt.json');
 export const DEFAULT_PROMPT_PROCESSING_FILE = path.join(DEFAULT_TMP_DIR, 'prompt.processing.json');
@@ -164,13 +207,16 @@ export function buildCombinedPromptData(messages) {
   };
 }
 
-export function findOrphanMessages(updates, adminIds) {
+export function findOrphanMessages(updates, adminIds, systemMsgIds = new Set()) {
   return updates.filter((u) => {
     const msg = u.message;
     if (!msg || !msg.text) return false;
     if (msg.chat.type !== 'private') return false;
     if (adminIds.length > 0 && !adminIds.includes(String(msg.chat.id))) return false;
-    if (msg.reply_to_message) return false;
+    // Replies to system messages (warnings the bot itself sent) are still orphans
+    // from any agent's perspective — no Monitor filter will match. Treat them as
+    // orphans so the user gets a fresh 💔 + warning rather than silent drop.
+    if (msg.reply_to_message && !systemMsgIds.has(`${msg.chat.id}:${msg.reply_to_message.message_id}`)) return false;
     // Bot API 7.0+: quote-replies may surface reply info in external_reply when the
     // user quoted a fragment, even if reply_to_message is absent. Treat as non-orphan.
     if (msg.external_reply) return false;
@@ -299,8 +345,8 @@ export function pruneCache(maxEntries = 500, cacheFile = UPDATES_CACHE_FILE) {
   fs.renameSync(tmp, cacheFile);
 }
 
-export function partitionOrphans(fetched, adminIds) {
-  const orphanEntries = findOrphanMessages(fetched, adminIds);
+export function partitionOrphans(fetched, adminIds, systemMsgIds = new Set()) {
+  const orphanEntries = findOrphanMessages(fetched, adminIds, systemMsgIds);
   const orphanIds = new Set(orphanEntries.map((e) => e.update.update_id));
   return {
     orphans: orphanEntries,
@@ -308,15 +354,38 @@ export function partitionOrphans(fetched, adminIds) {
   };
 }
 
-export async function reactToOrphans(token, orphanEntries) {
+export async function reactToOrphans(token, orphanEntries, systemMsgIds = new Set()) {
   const reacted = [];
   for (const entry of orphanEntries) {
+    const chatId = String(entry.msg.chat.id);
+    const msgId = entry.msg.message_id;
     try {
-      const { ok, description } = await postReaction(token, String(entry.msg.chat.id), entry.msg.message_id, '💔');
+      const { ok, description } = await postReaction(token, chatId, msgId, '💔');
       if (ok) reacted.push(entry);
-      else console.error(`[tele-listen] orphan react rejected for ${entry.msg.message_id}: ${description}`);
+      else console.error(`[tele-listen] orphan react rejected for ${msgId}: ${description}`);
     } catch (e) {
-      console.error(`[tele-listen] orphan react failed for ${entry.msg.message_id}: ${e instanceof Error ? e.message : String(e)}`);
+      console.error(`[tele-listen] orphan react failed for ${msgId}: ${e instanceof Error ? e.message : String(e)}`);
+    }
+    // Send an explanatory reply so first-time users understand why their message
+    // was ignored. Two variants: one for users who sent a plain message (no reply
+    // target), one for users who replied to a [SYSTEM] message by mistake. Once
+    // per orphan (orphans are partitioned out of the cache by the centralized
+    // fetch, so this never duplicates across loops).
+    const repliedToSystem = entry.msg.reply_to_message
+      && systemMsgIds.has(`${chatId}:${entry.msg.reply_to_message.message_id}`);
+    const text = repliedToSystem
+      ? '[SYSTEM] Please reply to a regular message, not [SYSTEM] message.'
+      : "[SYSTEM] You need to reply to one of AI agent's previous messages.";
+    try {
+      const res = await sendTextChunk(token, chatId, text, { plain: true, replyTo: msgId });
+      // Track the system message's own messageId so a user replying to *it*
+      // (instead of an agent message) is also detected as orphan on the next
+      // fetch — otherwise it would silently drop (no Monitor filter knows it).
+      // Skip recording if sendTextChunk fell back to .md document (long text or
+      // markdown parse error) — that .md is not a [SYSTEM] message.
+      if (res?.messageId && !res.fallback) appendSystemMsgId(chatId, res.messageId);
+    } catch (e) {
+      console.error(`[tele-listen] orphan reply-hint failed for ${msgId}: ${e instanceof Error ? e.message : String(e)}`);
     }
   }
   return reacted;
@@ -626,15 +695,21 @@ async function main() {
 
   // Centralized fetch: acquire lock, fetch updates, cache locally.
   // Orphans are detected and excluded from cache under lock; reaction happens after.
+  // The systemMsgIds snapshot is read ONCE per loop and reused for both the
+  // in-lock classification and the out-of-lock reply text selection, so a
+  // concurrent process appending a new id mid-loop can't flip an orphan's
+  // variant between detection and response.
   let fetchFailed = false;
   let pendingOrphans = [];
+  let systemMsgIdsSnapshot = new Set();
   const lockAcquired = acquirePollLock();
   if (lockAcquired) {
     try {
       const globalOffset = readOffset(GLOBAL_OFFSET_FILE);
       const fetched = await fetchUpdates(token, globalOffset);
       if (fetched.length > 0) {
-        const { orphans, nonOrphan } = partitionOrphans(fetched, adminIds);
+        systemMsgIdsSnapshot = readSystemMsgIds();
+        const { orphans, nonOrphan } = partitionOrphans(fetched, adminIds, systemMsgIdsSnapshot);
         pendingOrphans = orphans;
         if (nonOrphan.length > 0) appendToCache(nonOrphan);
         // Audit log: every fetched update with classification + reason. Lets us debug
@@ -685,9 +760,11 @@ async function main() {
     }
   }
 
-  // React 💔 to orphans outside lock (best-effort, does not block polling)
+  // React 💔 to orphans outside lock (best-effort, does not block polling).
+  // Use the same systemMsgIds snapshot captured under the lock for the variant
+  // text decision — keeps classification and response consistent.
   if (pendingOrphans.length > 0) {
-    await reactToOrphans(token, pendingOrphans);
+    await reactToOrphans(token, pendingOrphans, systemMsgIdsSnapshot);
   }
 
   // Resolve per-loop offset AFTER fetch+prune so a new loop's min(cache)
