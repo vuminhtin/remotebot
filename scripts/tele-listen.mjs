@@ -1376,49 +1376,118 @@ async function main() {
 
 // Supervisor for --watch: spawns child invocations of itself (without --watch)
 // in an internal loop so a single tele-listen process survives an agent turn
-// ending. Behavior:
-//   - Read --convo from argv (required for watch mode; parseArgs validates).
-//   - Loop: if prompt-convo-<N>.json exists, sleep (don't overwrite unconsumed
-//     prompt). Else spawn child; on child exit, sleep based on exit code:
-//       0 (wrote prompt) → wait for the prompt file to be deleted, then resume
-//       1 (error)         → sleep 12s then retry
-//       2 (no match / superseded / processing) → sleep 5s
-//   - Network/Telegram errors are reported by the child; supervisor just
-//     backs off and retries.
+// ending. Behavior per loop iteration:
+//   - If prompt-convo-<N>.json exists (unconsumed) → sleep 2s, retry.
+//   - Else spawn child. On child exit, sleep based on exit code:
+//       0 (wrote prompt) → no sleep; next iteration's exists-check serves as
+//                          the "wait until agent consumed" gate.
+//       1 (error)         → sleep 12s.
+//       2 (no match / superseded / processing) → sleep 5s.
+//   - SIGTERM/SIGINT forwarded to the current child and supervisor exits.
+const BACKOFF_MS = { success: 0, noMatch: 5000, error: 12000, promptExists: 2000 };
 // Singleton lock for the watcher supervisor. Agents may invoke `--watch &`
 // after every send (the hint suggests it); without this guard each invocation
 // would spawn a redundant supervisor → many parallel watchers polling the
-// same convo. Listener-registry supersede catches it at the CHILD level
-// (newer wins) but cause the loser-supervisor to spin in a spawn-die loop.
-// Cleaner: refuse to start a second supervisor for the same convo.
+// same convo. Listener-registry supersede catches the dup at the CHILD level
+// (newer wins) but causes the loser-supervisor to spin in a spawn-die loop.
+//
+// Body schema (v2): `v2\n<pid>\n<startTime>`. v2 requires startTime; if our
+// own ps capture fails we WARN and reject (don't write a degraded lock).
+// Liveness uses (PID alive AND startTime matches) so a recycled PID can't
+// masquerade as the original. Legacy single-line PID bodies (v1) fall back
+// to liveness-only (back-compat for in-flight watchers from older builds).
+//
+// mtime fallback: lock older than WATCHER_LOCK_MAX_AGE_MS without periodic
+// refresh is treated as stale (covers SIGKILL / segfault). A healthy
+// supervisor refreshes mtime every WATCHER_LOCK_REFRESH_MS so it's never
+// reaped while alive.
+//
+// Race protection: after the reap + reopen succeeds, we re-read the body to
+// verify it's OURS. If not, a peer raced us and won; we exit cleanly.
+const WATCHER_LOCK_MAX_AGE_MS = 30 * 60 * 1000;
+const WATCHER_LOCK_REFRESH_MS = 5 * 60 * 1000;
+const WATCHER_LOCK_BODY_VERSION = 'v2';
+
+function parseLockBody(raw) {
+  if (typeof raw !== 'string' || raw.length === 0) return null;
+  const lines = raw.split('\n');
+  if (lines[0] === WATCHER_LOCK_BODY_VERSION) {
+    return { version: 'v2', pid: Number(lines[1]), startTime: lines[2] ?? '' };
+  }
+  // Legacy v1: either bare PID or PID\nstartTime.
+  return { version: 'v1', pid: Number(lines[0]), startTime: lines[1] ?? '' };
+}
+function isWatcherLockHolderAlive(body) {
+  const parsed = parseLockBody(body);
+  if (!parsed || !Number.isInteger(parsed.pid) || parsed.pid <= 1) return false;
+  if (!isProcessAlive(parsed.pid)) return false;
+  // v2: startTime REQUIRED. Absent → schema violation → treat as stale.
+  if (parsed.version === 'v2') {
+    if (!parsed.startTime) return false;
+    const current = getProcessStartTime(parsed.pid);
+    return current != null && current === parsed.startTime;
+  }
+  // v1: when startTime present, require match; otherwise liveness-only.
+  if (parsed.startTime) {
+    const current = getProcessStartTime(parsed.pid);
+    return current != null && current === parsed.startTime;
+  }
+  return true; // legacy v1 bare-PID: best-effort
+}
 async function acquireWatcherSingletonLock(convo) {
   fs.mkdirSync(DEFAULT_TMP_DIR, { recursive: true });
   const lockFile = path.join(DEFAULT_TMP_DIR, `watcher-convo-${convo}.lock`);
-  // Single attempt with stale-reap; we don't retry — if another live watcher
-  // exists the agent's repeated invocations are intentional no-ops.
-  try {
-    const fd = fs.openSync(lockFile, 'wx');
-    fs.writeSync(fd, String(process.pid));
-    fs.closeSync(fd);
-    return lockFile;
-  } catch (e) {
-    if (e.code !== 'EEXIST') throw e;
-    let body = '';
-    try { body = fs.readFileSync(lockFile, 'utf8').trim(); } catch {}
-    const otherPid = parseInt(body, 10);
-    const alive = Number.isInteger(otherPid) && otherPid > 1
-      && (() => { try { process.kill(otherPid, 0); return true; }
-                  catch (err) { return err.code === 'EPERM'; } })();
-    if (alive) return null;
-    // Stale lock: previous watcher died without cleanup. Reap and retry once.
-    try { fs.unlinkSync(lockFile); } catch {}
+  const myStartTime = getProcessStartTime(process.pid);
+  if (!myStartTime) {
+    console.error('[tele-watch] WARNING: could not capture own startTime; falling back to PID-only v1 lock body');
+  }
+  const body = myStartTime
+    ? `${WATCHER_LOCK_BODY_VERSION}\n${process.pid}\n${myStartTime}`
+    : `${process.pid}`;
+  const MAX_ATTEMPTS = 3;
+  for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
     try {
       const fd = fs.openSync(lockFile, 'wx');
-      fs.writeSync(fd, String(process.pid));
+      fs.writeSync(fd, body);
       fs.closeSync(fd);
+      // Race-verify: re-read and confirm OUR body landed. A peer that
+      // unlink+reopened concurrently could overwrite us between writeSync
+      // and now if we both went through reap-and-retry. (Theoretically the
+      // O_EXCL guarantees only one succeeds per file-version; but defense in
+      // depth.)
+      const verify = fs.readFileSync(lockFile, 'utf8').trim();
+      if (verify !== body) {
+        const pidStr = (verify.split('\n')[0] || '?');
+        console.log(`[tele-watch] lost race after reap; another watcher (pid ${pidStr}) won for convo ${convo}; exiting`);
+        return null;
+      }
       return lockFile;
-    } catch { return null; }
+    } catch (e) {
+      if (e.code !== 'EEXIST') throw e;
+      let existing = '';
+      try { existing = fs.readFileSync(lockFile, 'utf8').trim(); } catch {}
+      let mtimeStale = false;
+      try {
+        const st = fs.statSync(lockFile);
+        if (Date.now() - st.mtimeMs > WATCHER_LOCK_MAX_AGE_MS) mtimeStale = true;
+      } catch {}
+      if (!mtimeStale && isWatcherLockHolderAlive(existing)) {
+        const pidStr = (existing.split('\n').find((l) => /^\d+$/.test(l)) || '?');
+        console.log(`[tele-watch] another watcher (pid ${pidStr}) is already running for convo ${convo}; exiting`);
+        return null;
+      }
+      try { fs.unlinkSync(lockFile); } catch {}
+      await new Promise((r) => setTimeout(r, 20 + Math.floor(Math.random() * 30)));
+    }
   }
+  console.log(`[tele-watch] could not acquire singleton lock for convo ${convo} after ${MAX_ATTEMPTS} attempts; exiting`);
+  return null;
+}
+
+// Touch mtime so a healthy long-running supervisor never gets reaped by the
+// mtime-stale fallback. Cheap (single utimes syscall every 5 min).
+function refreshWatcherLockMtime(lockFile) {
+  try { fs.utimesSync(lockFile, new Date(), new Date()); } catch {}
 }
 
 async function watchSupervisor(argv) {
@@ -1434,12 +1503,16 @@ async function watchSupervisor(argv) {
   }
   const singletonLock = await acquireWatcherSingletonLock(args.convo);
   if (singletonLock == null) {
-    console.log(`[tele-watch] another watcher is already running for convo ${args.convo}; exiting`);
+    // acquireWatcherSingletonLock already logged the reason.
     process.exit(0);
   }
   // Release lock on every exit path. `process.on('exit')` only allows sync ops.
   const releaseSingleton = () => { try { fs.unlinkSync(singletonLock); } catch {} };
   process.on('exit', releaseSingleton);
+  // Periodic mtime touch so a healthy supervisor is never reaped by the
+  // stale-mtime fallback in acquireWatcherSingletonLock.
+  const refreshTimer = setInterval(() => refreshWatcherLockMtime(singletonLock), WATCHER_LOCK_REFRESH_MS);
+  refreshTimer.unref?.(); // don't keep the event loop alive solely for this
   const promptFile = path.join(DEFAULT_TMP_DIR, `prompt-convo-${args.convo}.json`);
   // Strip --watch from the child argv; pass --convo explicitly.
   const childArgs = [process.argv[1], '--convo', String(args.convo)];
@@ -1452,24 +1525,60 @@ async function watchSupervisor(argv) {
   console.log(`[tele-watch] supervisor started for convo ${args.convo} (pid ${process.pid})`);
 
   // Graceful shutdown so a ctrl-C/SIGTERM doesn't leave a stale lock.
+  // SIGNAL_GRACE_MS: how long to wait for the child to exit cleanly after
+  // forwarding the signal. After that, SIGKILL the child and force-exit so a
+  // stuck child can never strand the supervisor (and its singleton lock).
+  const SIGNAL_GRACE_MS = 5000;
   let stopping = false;
   let currentChild = null;
   for (const sig of ['SIGINT', 'SIGTERM']) {
     process.on(sig, () => {
+      if (stopping) return; // idempotent on second signal
       stopping = true;
-      console.log(`[tele-watch] received ${sig}; forwarding to child + exiting`);
+      console.log(`[tele-watch] received ${sig}; forwarding to child + exiting (grace ${SIGNAL_GRACE_MS}ms)`);
       if (currentChild && !currentChild.killed) {
         try { currentChild.kill(sig); } catch {}
+        // Force-exit if the child ignores the signal.
+        setTimeout(() => {
+          if (currentChild && !currentChild.killed) {
+            console.error('[tele-watch] child did not exit within grace period; SIGKILL + force exit');
+            try { currentChild.kill('SIGKILL'); } catch {}
+          }
+          releaseSingleton();
+          process.exit(1);
+        }, SIGNAL_GRACE_MS).unref?.();
+      } else {
+        // No child running — exit immediately.
+        releaseSingleton();
+        process.exit(0);
       }
     });
   }
 
+  // Pending/resume logging state — log transition edges only, not every poll,
+  // so the operator sees clear markers in the log stream:
+  //   "prompt pending — waiting for agent consume"
+  //   "prompt consumed — resuming polling"
+  let pendingLogged = false;
   while (!stopping) {
     // Don't overwrite an unconsumed prompt — the agent hasn't read it yet.
+    // NOTE: while paused here, this supervisor's child is NOT polling Telegram.
+    // Other listeners (e.g. Claude Monitor) may still fetch + cache updates;
+    // when the agent consumes the prompt, our next child poll reads them from
+    // the local cache. If the only listener is THIS supervisor, replies that
+    // arrive while paused will be picked up on the resume — the cache window
+    // is bounded (500 updates) so very high admin-traffic bursts could miss.
     if (fs.existsSync(promptFile)) {
-      // Light polling for consumption to keep the responsiveness predictable.
-      await new Promise((r) => setTimeout(r, 2000));
+      if (!pendingLogged) {
+        console.log(`[tele-watch] prompt pending — waiting for agent to consume ${path.basename(promptFile)}`);
+        pendingLogged = true;
+      }
+      await new Promise((r) => setTimeout(r, BACKOFF_MS.promptExists));
       continue;
+    }
+    if (pendingLogged) {
+      console.log('[tele-watch] prompt consumed — resuming polling');
+      pendingLogged = false;
     }
     const exitCode = await new Promise((resolve) => {
       const child = spawn(process.execPath, childArgs, {
@@ -1485,8 +1594,10 @@ async function watchSupervisor(argv) {
       });
     });
     if (stopping) break;
-    const sleepMs = exitCode === 0 ? 1000 : exitCode === 2 ? 5000 : 12000;
-    await new Promise((r) => setTimeout(r, sleepMs));
+    const sleepMs = exitCode === 0 ? BACKOFF_MS.success
+      : exitCode === 2 ? BACKOFF_MS.noMatch
+      : BACKOFF_MS.error;
+    if (sleepMs > 0) await new Promise((r) => setTimeout(r, sleepMs));
   }
   console.log(`[tele-watch] supervisor exiting`);
 }

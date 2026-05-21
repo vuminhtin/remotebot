@@ -99,7 +99,17 @@ Monitor({
 ```bash
 node ../teleport/scripts/tele-listen.mjs --watch --convo $CONVO_ID &
 ```
-The supervisor process loops internally: poll → write `prompt-convo-<N>.json` → wait until the file is deleted (= agent consumed) → resume. Survives agent turn end. Kill via `pkill -f "tele-listen.*--watch.*--convo $CONVO_ID"` when done with the conversation.
+The supervisor process loops internally: poll → write `prompt-convo-<N>.json` → wait until the file is deleted (= agent consumed) → resume. Survives agent turn end at the OS level. Kill via `pkill -f "tele-listen.*--watch.*--convo ${CONVO_ID}( |$)"` when done with the conversation (the `( |$)` word-boundary prevents `--convo 12` from matching `--convo 123`).
+
+**Codex-specific turn rule:** the watcher process survives Codex's turn at the OS level, but **Codex itself stops polling once it sends a final assistant response**. So even with the daemon running, replies pile up in `prompt-convo-<N>.json` with no agent to consume them.
+
+After starting `--watch`:
+- Do NOT send a final assistant response while expecting Telegram replies.
+- Keep the Codex turn active and poll the watcher (e.g. `until [ -f prompt-convo-$CONVO_ID.json ]; do sleep 5; done` then read+reply+delete).
+- Loop on the watcher: when prompt appears → read JSON → reply via send-telegram → delete the prompt file → loop.
+- Send the final response only when the user explicitly closes the convo or the task is genuinely done.
+
+**Gemini:** the daemon survives turn end. Foreground wait is bounded ~5 min but agent runtime keeps polling across turns, so consume works naturally.
 
 When the loop / daemon writes `prompt written to <path>`, parse that file as JSON:
 - `text`, `messageId`, `chatId`, `replyToMessageId`, `replyToText`, `quotedText`, `convoId`, `attachments[]`.
