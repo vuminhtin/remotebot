@@ -3,7 +3,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import https from 'node:https';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { loadEnvFromFile, parseAdminChatIds, postReaction, sendTextChunk, extractBotId, readSentRegistry } from './send-telegram.mjs';
 import {
@@ -173,7 +173,12 @@ export function parseArgs(argv) {
   let offsetFileProvided = false;
   let convo = null;
   let legacyFilter = false;
+  let watch = false;
   for (let i = 0; i < argv.length; i++) {
+    if (argv[i] === '--watch') {
+      watch = true;
+      continue;
+    }
     if (argv[i] === '--legacy-filter') {
       legacyFilter = true;
       continue;
@@ -212,7 +217,10 @@ export function parseArgs(argv) {
   if (legacyFilter && filterReplyTo == null) {
     throw new Error('--legacy-filter requires --filter-reply-to (it suppresses the env check applied to legacy mode)');
   }
-  return { filterReplyTo, offsetFile, offsetFileProvided, convo, legacyFilter };
+  if (watch && filterReplyTo != null) {
+    throw new Error('--watch is convo-mode only; --filter-reply-to not supported in watch mode');
+  }
+  return { filterReplyTo, offsetFile, offsetFileProvided, convo, legacyFilter, watch };
 }
 
 // extractBotId is imported from send-telegram.mjs (single source of truth).
@@ -1366,10 +1374,91 @@ async function main() {
   process.exit(0);
 }
 
+// Supervisor for --watch: spawns child invocations of itself (without --watch)
+// in an internal loop so a single tele-listen process survives an agent turn
+// ending. Behavior:
+//   - Read --convo from argv (required for watch mode; parseArgs validates).
+//   - Loop: if prompt-convo-<N>.json exists, sleep (don't overwrite unconsumed
+//     prompt). Else spawn child; on child exit, sleep based on exit code:
+//       0 (wrote prompt) → wait for the prompt file to be deleted, then resume
+//       1 (error)         → sleep 12s then retry
+//       2 (no match / superseded / processing) → sleep 5s
+//   - Network/Telegram errors are reported by the child; supervisor just
+//     backs off and retries.
+async function watchSupervisor(argv) {
+  const args = parseArgs(argv);
+  if (args.convo == null) {
+    // Fall through to env resolution to find the convo.
+    const r = resolveConvoIdFromEnv({ argConvo: null });
+    if (r.convoId == null) {
+      console.error('[tele-listen] --watch requires --convo <N> or a native session env var');
+      process.exit(1);
+    }
+    args.convo = r.convoId;
+  }
+  const promptFile = path.join(DEFAULT_TMP_DIR, `prompt-convo-${args.convo}.json`);
+  // Strip --watch from the child argv; pass --convo explicitly.
+  const childArgs = [process.argv[1], '--convo', String(args.convo)];
+  for (let i = 0; i < argv.length; i++) {
+    if (argv[i] === '--watch') continue;
+    if (argv[i] === '--convo') { i++; continue; }
+    childArgs.push(argv[i]);
+  }
+
+  console.log(`[tele-watch] supervisor started for convo ${args.convo} (pid ${process.pid})`);
+
+  // Graceful shutdown so a ctrl-C/SIGTERM doesn't leave a stale lock.
+  let stopping = false;
+  let currentChild = null;
+  for (const sig of ['SIGINT', 'SIGTERM']) {
+    process.on(sig, () => {
+      stopping = true;
+      console.log(`[tele-watch] received ${sig}; forwarding to child + exiting`);
+      if (currentChild && !currentChild.killed) {
+        try { currentChild.kill(sig); } catch {}
+      }
+    });
+  }
+
+  while (!stopping) {
+    // Don't overwrite an unconsumed prompt — the agent hasn't read it yet.
+    if (fs.existsSync(promptFile)) {
+      // Light polling for consumption to keep the responsiveness predictable.
+      await new Promise((r) => setTimeout(r, 2000));
+      continue;
+    }
+    const exitCode = await new Promise((resolve) => {
+      const child = spawn(process.execPath, childArgs, {
+        stdio: 'inherit',
+        env: process.env,
+      });
+      currentChild = child;
+      child.on('exit', (code) => { currentChild = null; resolve(code ?? 1); });
+      child.on('error', (e) => {
+        currentChild = null;
+        console.error(`[tele-watch] child spawn failed: ${e instanceof Error ? e.message : String(e)}`);
+        resolve(1);
+      });
+    });
+    if (stopping) break;
+    const sleepMs = exitCode === 0 ? 1000 : exitCode === 2 ? 5000 : 12000;
+    await new Promise((r) => setTimeout(r, sleepMs));
+  }
+  console.log(`[tele-watch] supervisor exiting`);
+}
+
 const isDirectRun = fileURLToPath(import.meta.url) === path.resolve(process.argv[1] ?? '');
 if (isDirectRun) {
-  main().catch((e) => {
-    console.error(`[tele-listen] ${e instanceof Error ? e.message : String(e)}`);
-    process.exit(1);
-  });
+  const argv = process.argv.slice(2);
+  if (argv.includes('--watch')) {
+    watchSupervisor(argv).catch((e) => {
+      console.error(`[tele-watch] ${e instanceof Error ? e.message : String(e)}`);
+      process.exit(1);
+    });
+  } else {
+    main().catch((e) => {
+      console.error(`[tele-listen] ${e instanceof Error ? e.message : String(e)}`);
+      process.exit(1);
+    });
+  }
 }

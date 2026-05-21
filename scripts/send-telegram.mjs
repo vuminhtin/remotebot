@@ -653,6 +653,7 @@ async function main() {
     const caption = projectCode && rawCaption ? `[${projectCode}] ${rawCaption}` : rawCaption;
 
     let failures = 0;
+    let lastConvoId = null;
     for (const chatId of effectiveAdminIds) {
       try {
         let convoIdForSend = resolveConvoIdPreSend({ preResolved, replyTo: args.replyTo, chatId, botId });
@@ -660,6 +661,7 @@ async function main() {
         if (convoIdForSend == null) convoIdForSend = messageId; // new convo
         appendToSentRegistry({ messageId, chatId, botId, convoId: convoIdForSend });
         const recordedConvoId = await maybeRecordConvo({ convoId: convoIdForSend, messageId, chatId, botId });
+        if (recordedConvoId != null) lastConvoId = recordedConvoId;
         const parts = [];
         if (fallback) parts.push('caption sent as plain text');
         if (messageId) parts.push(`messageId: ${messageId}`);
@@ -674,7 +676,7 @@ async function main() {
     }
     if (failures === effectiveAdminIds.length) process.exit(1);
     if (failures < effectiveAdminIds.length) {
-      console.log('[send-telegram] ⚠️ You MUST now start a reply listener (Monitor tool or foreground loop). See telegram-guide.md §Listening for Replies.');
+      console.log(listenerHintForCurrentAgent(lastConvoId));
     }
     return;
   }
@@ -695,6 +697,7 @@ async function main() {
   }
 
   let failures = 0;
+  let lastConvoId = null;
   for (const chatId of effectiveAdminIds) {
     try {
       let convoIdForSend = resolveConvoIdPreSend({ preResolved, replyTo: args.replyTo, chatId, botId });
@@ -702,6 +705,7 @@ async function main() {
       if (convoIdForSend == null) convoIdForSend = messageId; // new convo
       for (const mid of allMessageIds) appendToSentRegistry({ messageId: mid, chatId, botId, convoId: convoIdForSend });
       const recordedConvoId = await maybeRecordConvo({ convoId: convoIdForSend, messageId, chatId, botId });
+      if (recordedConvoId != null) lastConvoId = recordedConvoId;
       const parts = [];
       if (fallback === 'auto-file') parts.push('long-message → .md file');
       else if (fallback === 'parse-error-file') parts.push('markdown-parse-error → .md file');
@@ -718,7 +722,7 @@ async function main() {
 
   if (failures === effectiveAdminIds.length) process.exit(1);
   if (failures < effectiveAdminIds.length) {
-    console.log('[send-telegram] ⚠️ You MUST now start a reply listener (Monitor tool or foreground loop). See telegram-guide.md §Listening for Replies.');
+    console.log(listenerHintForCurrentAgent(lastConvoId));
   }
 }
 
@@ -756,6 +760,25 @@ async function maybeRecordConvo({ convoId, messageId, chatId, botId }) {
     return convoId; // still echo so the agent can log + start its listener
   }
   return result.convoId;
+}
+
+// Tailor the "now start a listener" reminder by detected agent:
+//   - Claude (CLAUDE_CODE_SESSION_ID set) → suggest Monitor tool.
+//   - Codex (CODEX_THREAD_ID set) → suggest --watch daemon (Codex's foreground
+//     dies when the turn ends; a one-shot until-loop is insufficient).
+//   - Other (Gemini / plain shell) → suggest --watch daemon too (Gemini's
+//     foreground wait is bounded ~5min).
+// Hint is best-effort; agent can override if it knows better. If env is
+// missing despite running Claude, the agent still has its Monitor tool.
+function listenerHintForCurrentAgent(convoId) {
+  const convoArg = convoId != null ? ` --convo ${convoId}` : '';
+  if (process.env.CLAUDE_CODE_SESSION_ID) {
+    return `[send-telegram] ⚠️ Start a reply listener via Monitor: \`until node ../teleport/scripts/tele-listen.mjs${convoArg}; do sleep 12; done\``;
+  }
+  if (process.env.CODEX_THREAD_ID) {
+    return `[send-telegram] ⚠️ Start a persistent watcher (Codex foreground dies on turn end): \`node ../teleport/scripts/tele-listen.mjs --watch${convoArg} &\``;
+  }
+  return `[send-telegram] ⚠️ Start a persistent watcher: \`node ../teleport/scripts/tele-listen.mjs --watch${convoArg} &\``;
 }
 
 function emitConvoLine({ convoId, messageId }) {

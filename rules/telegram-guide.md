@@ -81,7 +81,9 @@ Capture `<N>` once; pass to the listener as `--convo <N>`.
 
 ## Listening for replies (MUST after every successful send)
 
-**Claude (Monitor tool):**
+Pick the mode per agent. `send-telegram.mjs` prints an agent-aware hint on stdout — match its suggestion.
+
+**Claude (Monitor tool):** one-shot tele-listen inside an `until` loop. Monitor restarts it after each reply.
 ```
 TaskStop(task_id: <LAST_MONITOR_ID>)   # skip on first send
 
@@ -93,12 +95,13 @@ Monitor({
 })
 ```
 
-**Codex / Gemini / others (foreground loop):**
+**Codex / Gemini / others (`--watch` daemon — REQUIRED):** Codex foreground exec dies when the agent's turn ends; Gemini's foreground wait is bounded ~5 min. A one-shot `until` loop is insufficient.
 ```bash
-until node ../teleport/scripts/tele-listen.mjs --convo $CONVO_ID; do sleep 5; done
+node ../teleport/scripts/tele-listen.mjs --watch --convo $CONVO_ID &
 ```
+The supervisor process loops internally: poll → write `prompt-convo-<N>.json` → wait until the file is deleted (= agent consumed) → resume. Survives agent turn end. Kill via `pkill -f "tele-listen.*--watch.*--convo $CONVO_ID"` when done with the conversation.
 
-When the loop exits with `prompt written to <path>`, parse that file as JSON:
+When the loop / daemon writes `prompt written to <path>`, parse that file as JSON:
 - `text`, `messageId`, `chatId`, `replyToMessageId`, `replyToText`, `quotedText`, `convoId`, `attachments[]`.
 
 Reply:
@@ -127,7 +130,8 @@ Then delete the prompt JSON. Restart the listener (same command).
 - `--react <messageId>` — react 👍 to a message.
 
 **tele-listen.mjs:**
-- `--convo <N>` — explicit convoId.
+- `--convo <N>` — explicit convoId (else read from env).
+- `--watch` — long-lived daemon. Loops: poll → write prompt → wait for consume → resume. Codex/Gemini MUST use this. Run with `&` to background.
 - `--filter-reply-to <IDS>` — legacy IDS-list mode. Errors if a native session env is set; pair with `--legacy-filter` to override.
 - `--legacy-filter` — opt-out of the legacy/env conflict check; requires `--filter-reply-to`.
 - `--offset-file <path>` — explicit offset file (auto-synthesised for convo mode).
