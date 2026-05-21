@@ -776,7 +776,17 @@ function listenerHintForCurrentAgent(convoId) {
     return `[send-telegram] ⚠️ Start a reply listener via Monitor: \`until node ../teleport/scripts/tele-listen.mjs${convoArg}; do sleep 12; done\``;
   }
   if (process.env.CODEX_THREAD_ID) {
-    return `[send-telegram] ⚠️ Start a persistent watcher (Codex foreground dies on turn end): \`node ../teleport/scripts/tele-listen.mjs --watch${convoArg} &\``;
+    // The daemon survives turn end at the OS level, BUT Codex stops polling
+    // once it sends a final assistant response — so the prompt would pile up
+    // unconsumed. Spell out the turn-management rule so the agent doesn't
+    // close the turn prematurely.
+    return [
+      `[send-telegram] ⚠️ Start a persistent watcher: \`node ../teleport/scripts/tele-listen.mjs --watch${convoArg} &\``,
+      `[send-telegram] ⚠️ CODEX: do NOT send a final response while expecting Telegram replies.`,
+      `[send-telegram]    Keep the turn active and poll the watcher: \`until [ -f scripts/tmp/tele-reply/prompt-convo-${convoId ?? '<N>'}.json ]; do sleep 5; done\``,
+      `[send-telegram]    When the prompt appears: read JSON → reply via send-telegram → delete the JSON → loop.`,
+      `[send-telegram]    Send final only when the user closes the convo or task is done.`,
+    ].join('\n');
   }
   return `[send-telegram] ⚠️ Start a persistent watcher: \`node ../teleport/scripts/tele-listen.mjs --watch${convoArg} &\``;
 }
