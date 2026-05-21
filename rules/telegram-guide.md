@@ -209,6 +209,8 @@ When the loop succeeds, its output contains `prompt written to <path>`. Parse th
 
 Process the request, then reply via: `node ../teleport/scripts/send-telegram.mjs --reply-to <prompt.messageId> "E <response summary>"`. Capture new messageId M, append M to IDS.
 
+*Attachments:* if the prompt JSON has a non-empty `attachments[]`, each entry's `localPath` (when not null) points to a file under `../teleport/scripts/tmp/tele-reply/attachments/<bot_id>/<update_id>/`. After processing the prompt JSON and deleting it, **also delete each unique `attachments/<bot_id>/<update_id>/`** referenced by the entries (use `entry.botId` + `entry.updateId`). Entries with a non-null `error` (e.g. `exceeds_20mb`, `download_failed`) have `localPath: null`.
+
 **Note:** Only direct replies (to a message in your IDS) will reach your loop. Orphans are auto-reacted with 💔 at fetch level and never cached. Stale replies (to other agents' messages) are silently ignored. No agent reasoning needed for message routing.
 
 **After handling — restart the listener (this is a loop):**

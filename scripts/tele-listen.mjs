@@ -2,6 +2,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
+import https from 'node:https';
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { loadEnvFromFile, parseAdminChatIds, postReaction, sendTextChunk } from './send-telegram.mjs';
@@ -10,6 +11,19 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT_DIR = path.resolve(__dirname, '..');
 const ENV_FILE = path.join(ROOT_DIR, '.env');
 const TELEGRAM_API = 'https://api.telegram.org/bot';
+
+const ATTACHMENT_ERRORS = Object.freeze({
+  OVERSIZE: 'exceeds_20mb',
+  DOWNLOAD: 'download_failed',
+});
+const ATTACHMENT_MAX_BYTES = 20 * 1024 * 1024;
+const DOWNLOAD_CONNECT_TIMEOUT_MS = 30_000;
+const DOWNLOAD_OVERALL_TIMEOUT_MS = 60_000;
+const ATTACHMENT_PRUNE_KEEP = 500; // match pruneCache window
+
+class AttachmentError extends Error {
+  constructor(code) { super(code); this.code = code; }
+}
 
 export const DEFAULT_TMP_DIR = path.join(__dirname, 'tmp', 'tele-reply');
 export const DEFAULT_OFFSET_FILE = path.join(DEFAULT_TMP_DIR, 'last-update-id.txt');
@@ -169,6 +183,218 @@ export function parseArgs(argv) {
   return { filterReplyTo, offsetFile };
 }
 
+// Telegram bot tokens are formatted `<bot_id>:<auth_hash>`. We use bot_id as a
+// namespace for attachment dirs so a teleport tree shared by multiple bots (or
+// recycled across token swaps) does not let two bots' update_id sequences
+// collide on disk.
+function extractBotId(token) {
+  if (!token || typeof token !== 'string') return null;
+  const head = token.split(':')[0];
+  if (!/^\d+$/.test(head)) return null;
+  return Number(head);
+}
+
+function hasUserContent(msg) {
+  return Boolean(
+    msg && (msg.text || msg.caption || msg.document || (Array.isArray(msg.photo) && msg.photo.length))
+  );
+}
+
+function sanitizeFileName(rawName) {
+  if (!rawName || typeof rawName !== 'string') return null;
+  // Strip control chars and BIDI overrides
+  let name = rawName.replace(/[\x00-\x1F\u202A-\u202E\u2066-\u2069]/g, '');
+  // Reduce non-[A-Za-z0-9._-] runs to _
+  name = name.replace(/[^A-Za-z0-9._-]+/g, '_');
+  // Trim leading ._- and trailing dots/spaces
+  name = name.replace(/^[._-]+/, '').replace(/[.\s]+$/, '');
+  
+  if (!name || name === '.' || name === '..' || name === '...') return null;
+  
+  // Windows reserved names
+  const base = name.split('.')[0].toUpperCase();
+  const reserved = ['CON', 'PRN', 'AUX', 'NUL'];
+  if (reserved.includes(base) || /^COM[1-9]$/.test(base) || /^LPT[1-9]$/.test(base)) {
+    return null;
+  }
+  
+  // Cap at 100 chars (preserve extension when short)
+  if (name.length > 100) {
+    const extIdx = name.lastIndexOf('.');
+    if (extIdx !== -1 && name.length - extIdx <= 10) { // e.g. .pdf, .docx
+      const ext = name.slice(extIdx);
+      const baseName = name.slice(0, extIdx);
+      name = baseName.slice(0, 100 - ext.length) + ext;
+    } else {
+      name = name.slice(0, 100);
+    }
+  }
+  return name;
+}
+
+function extractAttachments(msg, updateId = null, botId = null) {
+  const out = [];
+  if (msg.document) {
+    const d = msg.document;
+    out.push({
+      kind: 'document', botId, updateId,
+      fileId: d.file_id, fileName: d.file_name ?? null,
+      mimeType: d.mime_type ?? null, fileSize: d.file_size ?? null,
+      localPath: null, error: null,
+    });
+  }
+  if (Array.isArray(msg.photo) && msg.photo.length) {
+    const largest = msg.photo[msg.photo.length - 1];
+    out.push({
+      kind: 'photo', botId, updateId,
+      fileId: largest.file_id, fileName: null,
+      mimeType: null, fileSize: largest.file_size ?? null,
+      localPath: null, error: null,
+    });
+  }
+  return out;
+}
+
+async function tgGetFile(token, fileId) {
+  const ac = new AbortController();
+  const t = setTimeout(() => ac.abort(), DOWNLOAD_CONNECT_TIMEOUT_MS);
+  try {
+    const res = await fetch(`${TELEGRAM_API}${token}/getFile?file_id=${fileId}`, { signal: ac.signal });
+    const body = await res.json().catch(() => ({}));
+    if (!res.ok || !body.ok) throw new Error(body?.description ?? `HTTP ${res.status}`);
+    return body.result;
+  } finally {
+    clearTimeout(t);
+  }
+}
+
+function guessExt(filePath) {
+  if (!filePath) return '';
+  const ext = path.extname(filePath);
+  return ext;
+}
+
+function streamDownload(token, filePath, finalPath) {
+  const partialPath = finalPath + '.partial';
+  return new Promise((resolve, reject) => {
+    const ac = new AbortController();
+    let settled = false;
+    let timeout, connectTimeout;
+    const settle = (err) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
+      clearTimeout(connectTimeout);
+      if (err) {
+        ac.abort();
+        try { fs.unlinkSync(partialPath); } catch {}
+        reject(err instanceof AttachmentError ? err : new AttachmentError(ATTACHMENT_ERRORS.DOWNLOAD));
+      } else {
+        resolve();
+      }
+    };
+    timeout = setTimeout(() => settle(new AttachmentError(ATTACHMENT_ERRORS.DOWNLOAD)), DOWNLOAD_OVERALL_TIMEOUT_MS);
+    connectTimeout = setTimeout(() => settle(new AttachmentError(ATTACHMENT_ERRORS.DOWNLOAD)), DOWNLOAD_CONNECT_TIMEOUT_MS);
+
+    const url = `https://api.telegram.org/file/bot${token}/${encodeURI(filePath)}`;
+    const req = https.request(url, { signal: ac.signal }, (res) => {
+      clearTimeout(connectTimeout);
+      if (res.statusCode !== 200) {
+        return settle(new AttachmentError(ATTACHMENT_ERRORS.DOWNLOAD));
+      }
+      const cl = res.headers['content-length'];
+      if (!cl || isNaN(parseInt(cl, 10)) || parseInt(cl, 10) > ATTACHMENT_MAX_BYTES) {
+        res.destroy();
+        return settle(new AttachmentError(ATTACHMENT_ERRORS.OVERSIZE));
+      }
+
+      const ws = fs.createWriteStream(partialPath);
+      let receivedBytes = 0;
+
+      res.on('data', (chunk) => {
+        if (settled) return;
+        receivedBytes += chunk.length;
+        if (receivedBytes > ATTACHMENT_MAX_BYTES) {
+          res.destroy();
+          ws.destroy();
+          settle(new AttachmentError(ATTACHMENT_ERRORS.OVERSIZE));
+        }
+      });
+
+      res.pipe(ws);
+
+      ws.on('finish', () => {
+        if (settled) return;
+        try {
+          const fd = fs.openSync(partialPath, 'r+');
+          fs.fsyncSync(fd);
+          fs.closeSync(fd);
+          fs.renameSync(partialPath, finalPath);
+          settle();
+        } catch {
+          settle(new AttachmentError(ATTACHMENT_ERRORS.DOWNLOAD));
+        }
+      });
+
+      ws.on('error', () => settle(new AttachmentError(ATTACHMENT_ERRORS.DOWNLOAD)));
+    });
+
+    req.on('error', (err) => {
+      if (err.name === 'AbortError') return; // already settled via timeout / oversize
+      settle(new AttachmentError(ATTACHMENT_ERRORS.DOWNLOAD));
+    });
+
+    req.end();
+  });
+}
+
+async function downloadAttachments(token, attachments, baseDir) {
+  const perMessage = new Map(); // updateId -> { dir, made, count }
+  for (const att of attachments) {
+    if (att.error || (att.kind !== 'document' && att.kind !== 'photo')) continue;
+    if (att.fileSize != null && att.fileSize > ATTACHMENT_MAX_BYTES) {
+      att.error = ATTACHMENT_ERRORS.OVERSIZE; continue;
+    }
+    let meta;
+    try { meta = await tgGetFile(token, att.fileId); }
+    catch { att.error = ATTACHMENT_ERRORS.DOWNLOAD; continue; }
+    
+    const ext = guessExt(meta.file_path);
+    const synthesized = att.kind + '-' + att.fileId.slice(-12) + ext;
+    const candidate =
+      sanitizeFileName(att.fileName) ??
+      sanitizeFileName(path.basename(meta.file_path)) ??
+      sanitizeFileName(synthesized) ??
+      (att.kind + '.bin');
+      
+    // Namespace by bot id so multiple bots sharing the same teleport tree
+    // (or a single tree across token swaps) cannot collide on update_id.
+    const botSegment = String(att.botId ?? 'unknown-bot');
+    const key = `${botSegment}/${att.updateId}`;
+    let entry = perMessage.get(key);
+    if (!entry) { entry = { dir: path.join(baseDir, botSegment, String(att.updateId)), made: false, count: 0 }; perMessage.set(key, entry); }
+    const indexedName = entry.count + '-' + candidate;
+    entry.count += 1;
+    
+    try {
+      if (!entry.made) { fs.mkdirSync(entry.dir, { recursive: true }); entry.made = true; }
+      const finalPath = path.join(entry.dir, indexedName);
+      const safeRoot = path.resolve(entry.dir) + path.sep;
+      if (!path.resolve(finalPath).startsWith(safeRoot)) throw new Error('path-escape');
+      await streamDownload(token, meta.file_path, finalPath);
+      att.localPath = finalPath;
+    } catch (err) {
+      att.error = (err instanceof AttachmentError) ? err.code : ATTACHMENT_ERRORS.DOWNLOAD;
+    }
+  }
+}
+
+function summarizeMediaReplyTarget(replyTo) {
+  if (replyTo.document) return `[document: ${replyTo.document.file_name ?? 'unknown'}]`;
+  if (replyTo.photo) return '[photo]';
+  return null;
+}
+
 export function filterAdminMessages(updates, adminIds, filterReplyTo = null) {
   const replyToSet = filterReplyTo == null ? null
     : Array.isArray(filterReplyTo) ? new Set(filterReplyTo)
@@ -176,7 +402,7 @@ export function filterAdminMessages(updates, adminIds, filterReplyTo = null) {
   return updates
     .filter((u) => {
       const msg = u.message;
-      if (!msg || !msg.text) return false;
+      if (!hasUserContent(msg)) return false;
       if (adminIds.length > 0 && !adminIds.includes(String(msg.chat.id))) return false;
       if (replyToSet != null && !replyToSet.has(msg.reply_to_message?.message_id)) return false;
       return true;
@@ -184,19 +410,20 @@ export function filterAdminMessages(updates, adminIds, filterReplyTo = null) {
     .map((u) => ({ update: u, msg: u.message }));
 }
 
-export function buildPromptData(msg) {
+export function buildPromptData(msg, updateId = null, botId = null) {
   const replyTo = msg.reply_to_message;
   return {
-    text: msg.text,
+    text: msg.text ?? msg.caption ?? '',
     messageId: msg.message_id,
     chatId: String(msg.chat.id),
     fromUserId: String(msg.from?.id ?? msg.chat.id),
     replyToMessageId: replyTo?.message_id ?? null,
     // Media-only messages have `.caption` instead of `.text`; fall back so the
     // agent still sees the human-readable context.
-    replyToText: replyTo?.text ?? replyTo?.caption ?? null,
+    replyToText: replyTo?.text ?? replyTo?.caption ?? (replyTo ? summarizeMediaReplyTarget(replyTo) : null),
     quotedText: msg.quote?.text ?? null,
     timestamp: msg.date,
+    attachments: extractAttachments(msg, updateId, botId),
   };
 }
 
@@ -207,31 +434,39 @@ export function buildPromptData(msg) {
  * LAST message (newest) so the AI replies to the right thread. Reply/quote
  * metadata from earlier messages in the batch is intentionally dropped.
  */
-export function buildCombinedPromptData(messages) {
+export function buildCombinedPromptData(messages, botId = null) {
   if (!messages.length) throw new Error('messages must not be empty');
   const [first, ...rest] = messages;
+  const getText = (m) => m.text ?? m.caption ?? '';
   const text =
     rest.length === 0
-      ? first.msg.text
-      : [first.msg.text, ...rest.map((m) => `Admin follow-up: ${m.msg.text}`)].join('\n\n');
+      ? getText(first.msg)
+      : [getText(first.msg), ...rest.map((m) => `Admin follow-up: ${getText(m.msg)}`)].join('\n\n');
   const last = messages[messages.length - 1].msg;
   const replyTo = last.reply_to_message;
+
+  const attachments = [];
+  for (const m of messages) {
+    attachments.push(...extractAttachments(m.msg, m.update?.update_id ?? null, botId));
+  }
+  
   return {
     text,
     messageId: last.message_id,
     chatId: String(last.chat.id),
     fromUserId: String(last.from?.id ?? last.chat.id),
     replyToMessageId: replyTo?.message_id ?? null,
-    replyToText: replyTo?.text ?? replyTo?.caption ?? null,
+    replyToText: replyTo?.text ?? replyTo?.caption ?? (replyTo ? summarizeMediaReplyTarget(replyTo) : null),
     quotedText: last.quote?.text ?? null,
     timestamp: last.date,
+    attachments,
   };
 }
 
 export function findOrphanMessages(updates, adminIds, systemMsgIds = new Set()) {
   return updates.filter((u) => {
     const msg = u.message;
-    if (!msg || !msg.text) return false;
+    if (!hasUserContent(msg)) return false;
     if (msg.chat.type !== 'private') return false;
     if (adminIds.length > 0 && !adminIds.includes(String(msg.chat.id))) return false;
     // Replies to system messages (warnings the bot itself sent) are still orphans
@@ -241,7 +476,7 @@ export function findOrphanMessages(updates, adminIds, systemMsgIds = new Set()) 
     // Bot API 7.0+: quote-replies may surface reply info in external_reply when the
     // user quoted a fragment, even if reply_to_message is absent. Treat as non-orphan.
     if (msg.external_reply) return false;
-    if (msg.text.trim().startsWith('/')) return false;
+    if (msg.text && msg.text.trim().startsWith('/')) return false;
     return true;
   }).map((u) => ({ update: u, msg: u.message, orphan: true }));
 }
@@ -656,6 +891,65 @@ export function writePromptAtomic(data, promptFile = DEFAULT_PROMPT_FILE) {
   fs.renameSync(tmp, promptFile);
 }
 
+// Read every prompt*.json sibling and collect a Set of `${botId}:${updateId}`
+// pairs so the prune sweep below skips any dir still pointed at by an
+// unconsumed prompt — even one that has sat idle for hours. The set is keyed
+// by both botId and updateId because multiple bots in the same teleport tree
+// have independent update_id sequences.
+function collectReferencedAttachments(promptDir) {
+  const referenced = new Set();
+  try {
+    for (const entry of fs.readdirSync(promptDir)) {
+      if (!entry.startsWith('prompt') || !entry.endsWith('.json')) continue;
+      try {
+        const data = JSON.parse(fs.readFileSync(path.join(promptDir, entry), 'utf8'));
+        for (const att of data.attachments ?? []) {
+          if (att && Number.isFinite(att.updateId)) {
+            referenced.add(`${att.botId ?? 'unknown-bot'}:${att.updateId}`);
+          }
+        }
+      } catch {}
+    }
+  } catch {}
+  return referenced;
+}
+
+// Prune `attachments/<bot_id>/<update_id>/` dirs an agent has clearly
+// abandoned. A dir is eligible for prune only when ALL of the following hold:
+//   - numeric `<update_id>` name well below the listener's globalOffset view
+//   - mtime older than 1 hour (avoids racing an in-progress agent read)
+//   - no live prompt JSON in the prompt dir still references that
+//     (botId, updateId) pair
+// Walks one level under each bot directory; non-numeric entries (e.g.
+// "unknown-bot" or stray scratch dirs) are walked the same way.
+function pruneAttachmentDirs(baseDir, globalOffset, promptDir) {
+  try {
+    if (!fs.existsSync(baseDir)) return;
+    const idThreshold = globalOffset - ATTACHMENT_PRUNE_KEEP;
+    const mtimeCutoff = Date.now() - 60 * 60 * 1000;
+    const referenced = collectReferencedAttachments(promptDir);
+    for (const botEntry of fs.readdirSync(baseDir)) {
+      const botDir = path.join(baseDir, botEntry);
+      let botStat;
+      try { botStat = fs.statSync(botDir); } catch { continue; }
+      if (!botStat.isDirectory()) continue;
+      for (const idEntry of fs.readdirSync(botDir)) {
+        if (!/^\d+$/.test(idEntry)) continue;
+        const id = parseInt(idEntry, 10);
+        if (id >= idThreshold) continue;
+        if (referenced.has(`${botEntry}:${id}`)) continue;
+        const dirPath = path.join(botDir, idEntry);
+        let mtime = 0;
+        try { mtime = fs.statSync(dirPath).mtimeMs; } catch { continue; }
+        if (mtime > mtimeCutoff) continue;
+        fs.rmSync(dirPath, { recursive: true, force: true });
+      }
+    }
+  } catch (e) {
+    console.error(`[tele-listen] pruneAttachmentDirs failed: ${e instanceof Error ? e.message : String(e)}`);
+  }
+}
+
 async function main() {
   let args;
   try {
@@ -773,6 +1067,7 @@ async function main() {
         writeOffset(maxUpdateId, GLOBAL_OFFSET_FILE);
       }
       pruneCache();
+      pruneAttachmentDirs(path.join(DEFAULT_TMP_DIR, 'attachments'), globalOffset, DEFAULT_TMP_DIR);
     } catch (e) {
       fetchFailed = true;
       console.error(`[tele-listen] getUpdates failed: ${e instanceof Error ? e.message : String(e)}`);
@@ -818,7 +1113,11 @@ async function main() {
   }
 
   let data;
-  data = buildCombinedPromptData(toProcess);
+  data = buildCombinedPromptData(toProcess, extractBotId(token));
+  if (data.attachments.length) {
+    const baseDir = path.join(path.dirname(promptFile), 'attachments');
+    await downloadAttachments(token, data.attachments, baseDir);
+  }
   writePromptAtomic(data, promptFile);
   // React 👍 AFTER successful prompt write to avoid false ack on failure.
   await reactToMessages(token, toProcess);
