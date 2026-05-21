@@ -1476,7 +1476,14 @@ async function acquireWatcherSingletonLock(convo) {
         console.log(`[tele-watch] another watcher (pid ${pidStr}) is already running for convo ${convo}; exiting`);
         return null;
       }
-      try { fs.unlinkSync(lockFile); } catch {}
+      // Reap the stale lock atomically: re-read immediately before unlinking.
+      // If the body changed between our liveness check and now, a peer already
+      // replaced the file — we'd delete THEIR fresh lock. Skip the unlink in
+      // that case and let the next loop iteration's EEXIST re-evaluate.
+      try {
+        const recheck = fs.readFileSync(lockFile, 'utf8').trim();
+        if (recheck === existing) fs.unlinkSync(lockFile);
+      } catch {}
       await new Promise((r) => setTimeout(r, 20 + Math.floor(Math.random() * 30)));
     }
   }
@@ -1484,10 +1491,11 @@ async function acquireWatcherSingletonLock(convo) {
   return null;
 }
 
-// Touch mtime so a healthy long-running supervisor never gets reaped by the
-// mtime-stale fallback. Cheap (single utimes syscall every 5 min).
-function refreshWatcherLockMtime(lockFile) {
-  try { fs.utimesSync(lockFile, new Date(), new Date()); } catch {}
+// Read what's currently in the lock file — used to capture "our body" so the
+// release path can verify we still own the lock before unlinking.
+async function readOurLockBody(lockFile) {
+  try { return fs.readFileSync(lockFile, 'utf8').trim(); }
+  catch { return ''; }
 }
 
 async function watchSupervisor(argv) {
@@ -1506,13 +1514,56 @@ async function watchSupervisor(argv) {
     // acquireWatcherSingletonLock already logged the reason.
     process.exit(0);
   }
+  // State shared across signal handler, refresh timer, and the main loop.
+  // `stopping` doubles as a wake-up signal for interruptible sleeps.
+  const ourBody = await readOurLockBody(singletonLock);
+  let lostRace = false;
+  let stopping = false;
+  let currentChild = null;
+  let stopResolve = null;
+  const stopPromise = new Promise((r) => { stopResolve = r; });
+  // Interruptible sleep that resolves early on shutdown signal.
+  const sleepMaybe = (ms) => {
+    if (ms <= 0 || stopping) return Promise.resolve();
+    return Promise.race([
+      new Promise((r) => setTimeout(r, ms)),
+      stopPromise,
+    ]);
+  };
   // Release lock on every exit path. `process.on('exit')` only allows sync ops.
-  const releaseSingleton = () => { try { fs.unlinkSync(singletonLock); } catch {} };
+  // CRITICAL: if we lost a race after writing (winner replaced our file), we
+  // MUST NOT unlink — otherwise we delete the winner's lock and a third
+  // supervisor sneaks in.
+  const releaseSingleton = () => {
+    if (lostRace) return;
+    try {
+      const current = fs.readFileSync(singletonLock, 'utf8').trim();
+      if (current !== ourBody) return; // someone else owns it now
+      fs.unlinkSync(singletonLock);
+    } catch {}
+  };
   process.on('exit', releaseSingleton);
-  // Periodic mtime touch so a healthy supervisor is never reaped by the
-  // stale-mtime fallback in acquireWatcherSingletonLock.
-  const refreshTimer = setInterval(() => refreshWatcherLockMtime(singletonLock), WATCHER_LOCK_REFRESH_MS);
-  refreshTimer.unref?.(); // don't keep the event loop alive solely for this
+  // Periodic mtime touch + missing-file re-acquire.
+  const refreshTimer = setInterval(() => {
+    if (lostRace || stopping) return;
+    try {
+      fs.utimesSync(singletonLock, new Date(), new Date());
+    } catch (e) {
+      if (e.code !== 'ENOENT') return;
+      try {
+        const fd = fs.openSync(singletonLock, 'wx');
+        fs.writeSync(fd, ourBody);
+        fs.closeSync(fd);
+      } catch {
+        lostRace = true;
+        console.log('[tele-watch] lock file taken over by another supervisor; exiting');
+        stopping = true;
+        stopResolve?.();
+        clearInterval(refreshTimer);
+        process.exit(0);
+      }
+    }
+  }, WATCHER_LOCK_REFRESH_MS);
   const promptFile = path.join(DEFAULT_TMP_DIR, `prompt-convo-${args.convo}.json`);
   // Strip --watch from the child argv; pass --convo explicitly.
   const childArgs = [process.argv[1], '--convo', String(args.convo)];
@@ -1525,31 +1576,30 @@ async function watchSupervisor(argv) {
   console.log(`[tele-watch] supervisor started for convo ${args.convo} (pid ${process.pid})`);
 
   // Graceful shutdown so a ctrl-C/SIGTERM doesn't leave a stale lock.
-  // SIGNAL_GRACE_MS: how long to wait for the child to exit cleanly after
-  // forwarding the signal. After that, SIGKILL the child and force-exit so a
-  // stuck child can never strand the supervisor (and its singleton lock).
+  // SIGNAL_GRACE_MS: wait this long for the child to exit cleanly after the
+  // forwarded signal; then SIGKILL + force-exit so a stuck child can never
+  // strand the supervisor (and its singleton lock).
   const SIGNAL_GRACE_MS = 5000;
-  let stopping = false;
-  let currentChild = null;
   for (const sig of ['SIGINT', 'SIGTERM']) {
     process.on(sig, () => {
-      if (stopping) return; // idempotent on second signal
+      if (stopping) return;
       stopping = true;
+      stopResolve?.(); // wake any sleepMaybe / stopPromise awaiter
+      clearInterval(refreshTimer);
       console.log(`[tele-watch] received ${sig}; forwarding to child + exiting (grace ${SIGNAL_GRACE_MS}ms)`);
-      if (currentChild && !currentChild.killed) {
+      const childStillRunning = (c) => c != null
+        && c.exitCode == null && c.signalCode == null;
+      if (childStillRunning(currentChild)) {
         try { currentChild.kill(sig); } catch {}
-        // Force-exit if the child ignores the signal.
+        // Ref'd timer (no unref) so it reliably fires across the grace window.
         setTimeout(() => {
-          if (currentChild && !currentChild.killed) {
+          if (childStillRunning(currentChild)) {
             console.error('[tele-watch] child did not exit within grace period; SIGKILL + force exit');
             try { currentChild.kill('SIGKILL'); } catch {}
           }
-          releaseSingleton();
           process.exit(1);
-        }, SIGNAL_GRACE_MS).unref?.();
+        }, SIGNAL_GRACE_MS);
       } else {
-        // No child running — exit immediately.
-        releaseSingleton();
         process.exit(0);
       }
     });
@@ -1573,7 +1623,7 @@ async function watchSupervisor(argv) {
         console.log(`[tele-watch] prompt pending — waiting for agent to consume ${path.basename(promptFile)}`);
         pendingLogged = true;
       }
-      await new Promise((r) => setTimeout(r, BACKOFF_MS.promptExists));
+      await sleepMaybe(BACKOFF_MS.promptExists);
       continue;
     }
     if (pendingLogged) {
@@ -1597,8 +1647,9 @@ async function watchSupervisor(argv) {
     const sleepMs = exitCode === 0 ? BACKOFF_MS.success
       : exitCode === 2 ? BACKOFF_MS.noMatch
       : BACKOFF_MS.error;
-    if (sleepMs > 0) await new Promise((r) => setTimeout(r, sleepMs));
+    await sleepMaybe(sleepMs);
   }
+  clearInterval(refreshTimer); // free the loop so the supervisor exits promptly
   console.log(`[tele-watch] supervisor exiting`);
 }
 

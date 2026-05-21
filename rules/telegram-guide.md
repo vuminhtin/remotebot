@@ -105,7 +105,8 @@ The supervisor process loops internally: poll → write `prompt-convo-<N>.json` 
 
 After starting `--watch`:
 - Do NOT send a final assistant response while expecting Telegram replies.
-- Keep the Codex turn active and poll the watcher (e.g. `until [ -f prompt-convo-$CONVO_ID.json ]; do sleep 5; done` then read+reply+delete).
+- Capture the convoId from `[send-telegram] convo: <N>` stdout: `export CONVO_ID=<N>`.
+- Keep the Codex turn active and poll the watcher (full path from project root): `until [ -f ../teleport/scripts/tmp/tele-reply/prompt-convo-$CONVO_ID.json ]; do sleep 5; done` then read+reply+delete.
 - Loop on the watcher: when prompt appears → read JSON → reply via send-telegram → delete the prompt file → loop.
 - Send the final response only when the user explicitly closes the convo or the task is genuinely done.
 
