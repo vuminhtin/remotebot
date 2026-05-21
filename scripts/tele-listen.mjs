@@ -185,12 +185,17 @@ export function filterAdminMessages(updates, adminIds, filterReplyTo = null) {
 }
 
 export function buildPromptData(msg) {
+  const replyTo = msg.reply_to_message;
   return {
     text: msg.text,
     messageId: msg.message_id,
     chatId: String(msg.chat.id),
     fromUserId: String(msg.from?.id ?? msg.chat.id),
-    replyToMessageId: msg.reply_to_message?.message_id ?? null,
+    replyToMessageId: replyTo?.message_id ?? null,
+    // Media-only messages have `.caption` instead of `.text`; fall back so the
+    // agent still sees the human-readable context.
+    replyToText: replyTo?.text ?? replyTo?.caption ?? null,
+    quotedText: msg.quote?.text ?? null,
     timestamp: msg.date,
   };
 }
@@ -198,8 +203,9 @@ export function buildPromptData(msg) {
 /**
  * Combine multiple admin messages into one prompt entry.
  * First message is primary; subsequent are appended as "Admin follow-up: …".
- * messageId/chatId/etc. are taken from the LAST message (newest) so the AI
- * replies to the right thread.
+ * messageId/chatId/timestamp + reply & quote metadata are taken from the
+ * LAST message (newest) so the AI replies to the right thread. Reply/quote
+ * metadata from earlier messages in the batch is intentionally dropped.
  */
 export function buildCombinedPromptData(messages) {
   if (!messages.length) throw new Error('messages must not be empty');
@@ -209,12 +215,15 @@ export function buildCombinedPromptData(messages) {
       ? first.msg.text
       : [first.msg.text, ...rest.map((m) => `Admin follow-up: ${m.msg.text}`)].join('\n\n');
   const last = messages[messages.length - 1].msg;
+  const replyTo = last.reply_to_message;
   return {
     text,
     messageId: last.message_id,
     chatId: String(last.chat.id),
     fromUserId: String(last.from?.id ?? last.chat.id),
-    replyToMessageId: last.reply_to_message?.message_id ?? null,
+    replyToMessageId: replyTo?.message_id ?? null,
+    replyToText: replyTo?.text ?? replyTo?.caption ?? null,
+    quotedText: last.quote?.text ?? null,
     timestamp: last.date,
   };
 }
