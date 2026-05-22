@@ -357,18 +357,29 @@ const LEADING_EMOJI_RE = /^(?:(?:(?:\p{Regional_Indicator}\p{Regional_Indicator}
 // (18 chars). Hoisted to module scope to avoid recompile per call.
 const MDV2_ALL_SPECIALS_RE = /[_*\[\]()~`>#+\-=|{}.!\\]/g;
 
-// Max length of the convoId tail in `#c<id>` hashtag (excluding leading `c`).
-// Claude/Codex env-derived convoIds are 16-digit integers (uuidToConvoInt hash);
-// Gemini's are 4 chars. We truncate to the LAST `CONVO_HASH_MAX_LEN` characters
-// of the convoId string so the hashtag stays short and readable while collision
-// risk between simultaneously-active convos remains negligible.
-// Why leading `c`: Telegram does NOT render pure-numeric `#1234` as a clickable
-// hashtag — at least one letter is required. `c` is the shortest mnemonic for
-// "convo". This is a Telegram constraint, not a teleport stylistic choice.
-export const CONVO_HASH_MAX_LEN = 7;
+// Build the convo-hashtag suffix. Telegram does NOT render pure-numeric
+// `#1234` as clickable — hashtags must contain at least one letter. Scheme:
+//
+// - Long convoId (≥ 8 chars, e.g. Claude/Codex 16-digit env hash):
+//   take the LAST 8 chars; convert the first of those 8 chars from digit→letter
+//   (0→a, 1→b, ..., 9→j). Total length: 8 chars (1 letter + 7 digits).
+//   Example: `2205483045424020` → `45424020` → `e5424020`.
+//
+// - Short convoId (< 8 chars, e.g. Gemini's 4-char id): prepend literal `t` to
+//   satisfy Telegram's "must contain a letter" rule. Total length: original + 1.
+//   Example: `1234` → `t1234`.
+//
+// `last 8` keeps high-entropy tail; sequential convoIds (messageId-as-convoId
+// for brand-new convos) differ most in low digits.
+export const CONVO_HASH_LONG_LEN = 8;
+const DIGIT_TO_LETTER = 'abcdefghij';
 export function shortConvoHash(convoId) {
   const s = String(convoId);
-  return 'c' + (s.length > CONVO_HASH_MAX_LEN ? s.slice(-CONVO_HASH_MAX_LEN) : s);
+  if (s.length < CONVO_HASH_LONG_LEN) return 't' + s;
+  const tail = s.slice(-CONVO_HASH_LONG_LEN);
+  const first = tail.charCodeAt(0) - 48; // '0'..'9' → 0..9
+  const letter = first >= 0 && first <= 9 ? DIGIT_TO_LETTER[first] : 't';
+  return letter + tail.slice(1);
 }
 
 // Long-message and Markdown-parse fallback captions previously used
@@ -379,8 +390,9 @@ export function shortConvoHash(convoId) {
 export function previewLineWithHashtag(text, maxLen = 100) {
   const firstLine = text.split('\n')[0];
   if (firstLine.length <= maxLen) return firstLine;
-  // Telegram hashtag rules: `#` + [letter/digit/_]+. Our hashtags are `#c<digits>`.
-  const m = firstLine.match(/#c\d+/);
+  // Our hashtags are `#<letter><digits>` per shortConvoHash. The leading
+  // letter is a-j (digit-encoded) or `t` (literal short-id prefix).
+  const m = firstLine.match(/#[a-jt]\d+/);
   if (!m) return firstLine.slice(0, maxLen);
   const tail = ` …${m[0]}`;
   const headBudget = Math.max(0, maxLen - tail.length);

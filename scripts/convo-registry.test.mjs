@@ -249,12 +249,12 @@ test('parseArgs (send-telegram) — --convo accepts a positive integer', () => {
 
 test('injectConvoHash — emoji prefix + convoId produces clickable hashtag', () => {
   const out = injectConvoHash('🦊 *Claude on topic:*\n\n✅ done', 'tea_game', 12345);
-  assert.strictEqual(out, '[tea_game] [🦊 #c12345] *Claude on topic:*\n\n✅ done');
+  assert.strictEqual(out, '[tea_game] [🦊 #t12345] *Claude on topic:*\n\n✅ done');
 });
 
 test('injectConvoHash — no emoji prefix falls back to [#c<id>] prefix', () => {
   const out = injectConvoHash('Plain text update', 'tea_game', 999);
-  assert.strictEqual(out, '[tea_game] [#c999] Plain text update');
+  assert.strictEqual(out, '[tea_game] [#t999] Plain text update');
 });
 
 test('injectConvoHash — null convoId keeps legacy [Project] prefix (no hashtag)', () => {
@@ -264,7 +264,7 @@ test('injectConvoHash — null convoId keeps legacy [Project] prefix (no hashtag
 
 test('injectConvoHash — missing projectCode emits bare [<emoji> #c<id>] tag', () => {
   const out = injectConvoHash('🦊 *topic*', '', 42);
-  assert.strictEqual(out, '[🦊 #c42] *topic*');
+  assert.strictEqual(out, '[🦊 #t42] *topic*');
 });
 
 test('injectConvoHash — null message returns null', () => {
@@ -279,12 +279,12 @@ test('injectConvoHash — empty message + convoId emits hashtag prefix only (no 
   // Document send with no caption still needs the hashtag so admins can filter.
   // No trailing space so the caption is clean.
   const out = injectConvoHash('', 'tea_game', 42);
-  assert.strictEqual(out, '[tea_game] [#c42]');
+  assert.strictEqual(out, '[tea_game] [#t42]');
 });
 
 test('injectConvoHash — empty message + convoId + no projectCode emits bare hashtag', () => {
   const out = injectConvoHash('', '', 42);
-  assert.strictEqual(out, '[#c42]');
+  assert.strictEqual(out, '[#t42]');
 });
 
 test('parseArgs (send-telegram) — --raw and --plain are mutually exclusive', () => {
@@ -294,7 +294,7 @@ test('parseArgs (send-telegram) — --raw and --plain are mutually exclusive', (
 test('injectConvoHash + escapeMarkdownV2 — hashtag survives escape pipeline', () => {
   // Non-raw mode: injectConvoHash returns unescaped prefix, then upstream
   // escapeMarkdownV2 escapes everything including `#`. Telegram's entity scanner
-  // runs on RENDERED text (after backslash unescape), so `\#c42` source still
+  // runs on RENDERED text (after backslash unescape), so `\#t42` source still
   // renders as `#c42` and is detected as a clickable hashtag.
   // This test locks in the expected escape format so a future regression in
   // escapeMarkdownV2 logic gets caught.
@@ -303,29 +303,39 @@ test('injectConvoHash + escapeMarkdownV2 — hashtag survives escape pipeline', 
   // tea_game is treated as text token; `_` only escapes when unbalanced (it
   // appears once = unbalanced, gets escaped). brackets and `#` always escape.
   assert.match(escaped, /\\\[tea[_\\_]+game\\\]/); // [tea_game] form
-  assert.match(escaped, /\\\[🦊 \\#c42\\\]/);     // [🦊 #c42] form with escaped # and brackets
+  assert.match(escaped, /\\\[🦊 \\#t42\\\]/);     // [🦊 #t42] form with escaped # and brackets
   // The `*topic*` markdown bold survives (balanced *).
   assert.match(escaped, /\*topic\*/);
 });
 
-test('shortConvoHash — truncates to last 7 chars + leading c', () => {
-  assert.strictEqual(shortConvoHash('2205483045424020'), 'c5424020');
-  assert.strictEqual(shortConvoHash(1234), 'c1234');
-  assert.strictEqual(shortConvoHash('1234567'), 'c1234567'); // boundary 7 chars
-  assert.strictEqual(shortConvoHash('12345678'), 'c2345678'); // 8 chars → truncated
+test('shortConvoHash — long id (≥8) takes last 8, encodes first digit as letter (0→a..9→j)', () => {
+  // last 8 of '2205483045424020' = '45424020', first '4' → 'e'
+  assert.strictEqual(shortConvoHash('2205483045424020'), 'e5424020');
+  // boundary: exactly 8 chars, first '1' → 'b'
+  assert.strictEqual(shortConvoHash('12345678'), 'b2345678');
+  // digit 0 → 'a'
+  assert.strictEqual(shortConvoHash('01234567'), 'a1234567');
+  // digit 9 → 'j'
+  assert.strictEqual(shortConvoHash('91234567'), 'j1234567');
+});
+
+test('shortConvoHash — short id (<8) prepends literal t', () => {
+  assert.strictEqual(shortConvoHash(1234), 't1234'); // 4 chars (Gemini case)
+  assert.strictEqual(shortConvoHash('1234567'), 't1234567'); // 7 chars (boundary)
+  assert.strictEqual(shortConvoHash('1'), 't1');
 });
 
 test('previewLineWithHashtag — short line returned as-is', () => {
-  assert.strictEqual(previewLineWithHashtag('[p] [🦊 #c123] short'), '[p] [🦊 #c123] short');
+  assert.strictEqual(previewLineWithHashtag('[p] [🦊 #t123] short'), '[p] [🦊 #t123] short');
 });
 
 test('previewLineWithHashtag — long line keeps hashtag at tail', () => {
   // Construct a first line where hashtag would normally be cut by slice(0, 100)
   const longProject = 'a'.repeat(80);
-  const line = `[${longProject}] [🦊 #c1234567] message body text follows here lots of words to push past limit`;
+  const line = `[${longProject}] [🦊 #t1234567] message body text follows here lots of words to push past limit`;
   const out = previewLineWithHashtag(line);
   assert.ok(out.length <= 100);
-  assert.match(out, /#c1234567$/);
+  assert.match(out, /#t1234567$/);
 });
 
 test('previewLineWithHashtag — long line with NO hashtag falls back to plain truncation', () => {
@@ -339,48 +349,48 @@ test('injectConvoHash — projectCode with newline is stripped to single line', 
   // POSIX allows newlines in directory names; basename(cwd) could in principle
   // contain \n. Our `[Project]` prefix must stay on line 1.
   const out = injectConvoHash('text', 'bad\nname', 1);
-  assert.strictEqual(out, '[badname] [#c1] text');
+  assert.strictEqual(out, '[badname] [#t1] text');
 });
 
 test('injectConvoHash — multiple leading emojis pulled into tag together', () => {
   const out = injectConvoHash('🦊🚀 *update*', 'p', 7);
-  assert.strictEqual(out, '[p] [🦊🚀 #c7] *update*');
+  assert.strictEqual(out, '[p] [🦊🚀 #t7] *update*');
 });
 
 test('injectConvoHash — long convoId is truncated to last 7 chars (Claude/Codex env hash case)', () => {
   // Claude/Codex env-derived convoIds are 16-digit ints (uuidToConvoInt).
   // Hashtag display truncates to last 7 digits so message stays readable.
   const out = injectConvoHash('🦊 *topic*', 'p', '2205483045424020');
-  assert.strictEqual(out, '[p] [🦊 #c5424020] *topic*');
+  assert.strictEqual(out, '[p] [🦊 #e5424020] *topic*');
 });
 
 test('injectConvoHash — short convoId (≤ 7 chars) keeps full id (Gemini case)', () => {
   // Gemini's convoId is 4 chars — no truncation needed.
   const out = injectConvoHash('🦊 *topic*', 'p', 1234);
-  assert.strictEqual(out, '[p] [🦊 #c1234] *topic*');
+  assert.strictEqual(out, '[p] [🦊 #t1234] *topic*');
 });
 
 test('injectConvoHash — exactly 7-char convoId keeps full id (boundary)', () => {
   const out = injectConvoHash('🦊 *topic*', 'p', '1234567');
-  assert.strictEqual(out, '[p] [🦊 #c1234567] *topic*');
+  assert.strictEqual(out, '[p] [🦊 #t1234567] *topic*');
 });
 
 test('injectConvoHash — skin-tone modifier on emoji', () => {
   // 👨🏽‍💻 = man + skin tone + ZWJ + laptop
   const out = injectConvoHash('👨🏽‍💻 *topic*', 'p', 1);
-  assert.strictEqual(out, '[p] [👨🏽‍💻 #c1] *topic*');
+  assert.strictEqual(out, '[p] [👨🏽‍💻 #t1] *topic*');
 });
 
 test('injectConvoHash — country flag (regional indicator pair)', () => {
   // 🇻🇳 = two regional indicators (V + N)
   const out = injectConvoHash('🇻🇳 *topic*', 'p', 1);
-  assert.strictEqual(out, '[p] [🇻🇳 #c1] *topic*');
+  assert.strictEqual(out, '[p] [🇻🇳 #t1] *topic*');
 });
 
 test('injectConvoHash — keycap sequence', () => {
   // 1️⃣ = digit 1 + VS-16 + COMBINING ENCLOSING KEYCAP
   const out = injectConvoHash('1️⃣ *topic*', 'p', 1);
-  assert.strictEqual(out, '[p] [1️⃣ #c1] *topic*');
+  assert.strictEqual(out, '[p] [1️⃣ #t1] *topic*');
 });
 
 test('injectConvoHash — raw mode escapes injected [, ], # for MarkdownV2', () => {
@@ -388,29 +398,29 @@ test('injectConvoHash — raw mode escapes injected [, ], # for MarkdownV2', () 
   // Brackets and # in our injected prefix must be MdV2-escaped so Telegram parser accepts.
   // tea_game has no special chars; pure underscore "_" is not special in MdV2 strictly
   // but our escape regex includes it for safety because MdV2 spec mandates escape.
-  assert.strictEqual(out, '\\[tea\\_game\\] \\[🦊 \\#c42\\] \\*pre\\-escaped\\*');
+  assert.strictEqual(out, '\\[tea\\_game\\] \\[🦊 \\#t42\\] \\*pre\\-escaped\\*');
 });
 
 test('injectConvoHash — raw mode escapes ALL 18 MdV2 special chars in projectCode', () => {
   // projectCode contains chars that MdV2 considers special: `.`, `-`
   const out = injectConvoHash('text', 'my.app-v2', 1, { pretokensEscaped: true });
-  assert.strictEqual(out, '\\[my\\.app\\-v2\\] \\[\\#c1\\] text');
+  assert.strictEqual(out, '\\[my\\.app\\-v2\\] \\[\\#t1\\] text');
 });
 
 test('injectConvoHash — raw mode + emoji combination', () => {
   const out = injectConvoHash('🦊🚀 \\*topic\\*', 'p', 5, { pretokensEscaped: true });
-  assert.strictEqual(out, '\\[p\\] \\[🦊🚀 \\#c5\\] \\*topic\\*');
+  assert.strictEqual(out, '\\[p\\] \\[🦊🚀 \\#t5\\] \\*topic\\*');
 });
 
 test('injectConvoHash — emoji directly followed by markdown asterisk (no space)', () => {
   // User types `🦊*bold*` with no space — regex should still extract emoji.
   const out = injectConvoHash('🦊*bold*', 'p', 1);
-  assert.strictEqual(out, '[p] [🦊 #c1] *bold*');
+  assert.strictEqual(out, '[p] [🦊 #t1] *bold*');
 });
 
 test('injectConvoHash — non-raw mode keeps injected prefix unescaped (escaped later by escapeMarkdownV2)', () => {
   const out = injectConvoHash('🦊 *topic*', 'tea_game', 42);
-  assert.strictEqual(out, '[tea_game] [🦊 #c42] *topic*');
+  assert.strictEqual(out, '[tea_game] [🦊 #t42] *topic*');
 });
 
 test('listenerHintForCurrentAgent — non-Claude agents use wait-once', () => {
