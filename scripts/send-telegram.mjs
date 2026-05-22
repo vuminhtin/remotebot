@@ -220,9 +220,11 @@ export function parseArgs(argv) {
     }
     if (arg === '--raw' || arg === '--md-raw') { result.raw = true; continue; }
     if (arg === '--plain') { result.plain = true; continue; }
+    // (mutual exclusion validated after the loop so order doesn't matter)
     if (arg.startsWith('--')) throw new Error(`Unknown flag: ${arg}`);
     result.positional.push(arg);
   }
+  if (result.raw && result.plain) throw new Error('--raw and --plain are mutually exclusive');
   return result;
 }
 
@@ -340,6 +342,104 @@ function countUnescapedMarkerInTextTokens(tokens, ch) {
     }
   }
   return n;
+}
+
+// Module-scope to avoid recompilation per call. Matches leading emoji glyphs:
+// - Extended_Pictographic base (covers most "picture" emojis)
+// - Optional Emoji_Modifier (skin tones)
+// - Optional VS-16 (️) on either side of ZWJ sequences
+// - ZWJ-joined continuations (‍ + next pictographic)
+// - Pairs of Regional_Indicator (country flags like 🇻🇳)
+// - Keycap sequences (digit/# + ️ + ⃣, e.g. 1️⃣, #️⃣)
+// - Repeated, separated by optional spaces — so "🦊🚀 " all get pulled into the tag
+const LEADING_EMOJI_RE = /^(?:(?:(?:\p{Regional_Indicator}\p{Regional_Indicator})|(?:[\d#*]️?⃣)|(?:\p{Extended_Pictographic}️?\p{Emoji_Modifier}?(?:‍\p{Extended_Pictographic}️?\p{Emoji_Modifier}?)*))\s*)+/u;
+// Telegram MarkdownV2 specials per https://core.telegram.org/bots/api#markdownv2-style
+// (18 chars). Hoisted to module scope to avoid recompile per call.
+const MDV2_ALL_SPECIALS_RE = /[_*\[\]()~`>#+\-=|{}.!\\]/g;
+
+// Max length of the convoId tail in `#c<id>` hashtag (excluding leading `c`).
+// Claude/Codex env-derived convoIds are 16-digit integers (uuidToConvoInt hash);
+// Gemini's are 4 chars. We truncate to the LAST `CONVO_HASH_MAX_LEN` characters
+// of the convoId string so the hashtag stays short and readable while collision
+// risk between simultaneously-active convos remains negligible.
+// Why leading `c`: Telegram does NOT render pure-numeric `#1234` as a clickable
+// hashtag — at least one letter is required. `c` is the shortest mnemonic for
+// "convo". This is a Telegram constraint, not a teleport stylistic choice.
+export const CONVO_HASH_MAX_LEN = 7;
+export function shortConvoHash(convoId) {
+  const s = String(convoId);
+  return 'c' + (s.length > CONVO_HASH_MAX_LEN ? s.slice(-CONVO_HASH_MAX_LEN) : s);
+}
+
+// Long-message and Markdown-parse fallback captions previously used
+// `text.split('\n')[0].slice(0, 100)` — which silently dropped the injected
+// `#c<id>` hashtag when the project code + emoji prefix pushed the hashtag
+// past the 100-char cut. Re-extract the hashtag and guarantee it appears in
+// the caption so document fallbacks remain filterable.
+export function previewLineWithHashtag(text, maxLen = 100) {
+  const firstLine = text.split('\n')[0];
+  if (firstLine.length <= maxLen) return firstLine;
+  // Telegram hashtag rules: `#` + [letter/digit/_]+. Our hashtags are `#c<digits>`.
+  const m = firstLine.match(/#c\d+/);
+  if (!m) return firstLine.slice(0, maxLen);
+  const tail = ` …${m[0]}`;
+  const headBudget = Math.max(0, maxLen - tail.length);
+  return firstLine.slice(0, headBudget) + tail;
+}
+
+/**
+ * Build the outgoing message prefix with project code + clickable convo hashtag.
+ *
+ * Returns the message body to hand to the send pipeline. The hashtag form
+ * `#c<convoId>` carries a leading `c` because Telegram does NOT render purely
+ * numeric `#1234` as a clickable hashtag — at least one letter is required.
+ *
+ * Format:
+ *   With leading emoji + convoId: `[<projectCode>] [<emoji> #c<convoId>] <rest>`
+ *   No leading emoji + convoId:   `[<projectCode>] [#c<convoId>] <message>`
+ *   No convoId:                   `[<projectCode>] <message>`  (legacy fallback)
+ *
+ * When convoId is unknown (first send of a brand-new convo without env-derived
+ * id), we fall back to the legacy no-hash format. Subsequent sends in the same
+ * convo will carry the hashtag once the convoId is registered.
+ *
+ * `pretokensEscaped = true` means the caller is in `--raw` mode and has
+ * pre-escaped its `rawMessage` for MarkdownV2; in that case we also escape the
+ * MdV2-special characters (`[`, `]`, `#`) in the injected prefix so Telegram's
+ * parser doesn't reject the message. The leading `c` of `#c<id>` is plain text
+ * and needs no escape; only the `#` character itself is special.
+ */
+export function injectConvoHash(rawMessage, projectCode, convoId, { pretokensEscaped = false } = {}) {
+  // Empty message stays empty UNLESS we have a convoId to surface — document
+  // sends with no caption still need a clickable hashtag so admins can filter.
+  if (rawMessage == null) return rawMessage;
+  if (rawMessage === '' && convoId == null) return rawMessage;
+  // Strip line separators from projectCode: POSIX allows newlines in directory
+  // names, and our `[Project]` prefix MUST be a single line so the hashtag
+  // stays on line 1 (where Telegram entity-detects it). Covers CR, LF, NEL,
+  // and Unicode line/paragraph separators.
+  if (projectCode) projectCode = String(projectCode).replace(/[\r\n\u0085\u2028\u2029]/g, '');
+  // In raw mode the caller has pre-escaped its message for MarkdownV2; we must
+  // escape EVERY MdV2-special char in OUR injected prefix or Telegram rejects
+  // the message with a parse error. Telegram lists 18 special chars; we apply
+  // them to projectCode (which may include `.`, `-`, `_` via cwd basename) and
+  // to our `[`, `]`, `#` syntax.
+  const esc = (s) => (pretokensEscaped ? s.replace(MDV2_ALL_SPECIALS_RE, (m) => '\\' + m) : s);
+  const projectPart = projectCode ? esc(`[${projectCode}] `) : '';
+  if (convoId == null) return projectPart + rawMessage;
+  const hash = `#${shortConvoHash(convoId)}`;
+  // Empty body: emit tag with no trailing space (document caption fallback).
+  if (rawMessage === '') {
+    const head = projectPart ? projectPart.replace(/ $/, '') : '';
+    return head ? `${head} ${esc(`[${hash}]`)}` : esc(`[${hash}]`);
+  }
+  const m = rawMessage.match(LEADING_EMOJI_RE);
+  if (m) {
+    const emoji = m[0].trim();
+    const rest = rawMessage.slice(m[0].length);
+    return `${projectPart}${esc(`[${emoji} ${hash}] `)}${rest}`;
+  }
+  return `${projectPart}${esc(`[${hash}] `)}${rawMessage}`;
 }
 
 export function escapeMarkdownV2(text) {
@@ -491,7 +591,7 @@ export async function sendTextChunk(token, chatId, rawChunk, { raw, plain, reply
       throw new Error(`markdown-file fallback failed to write tmp file: ${e instanceof Error ? e.message : String(e)}`);
     }
     try {
-      const firstLine = rawChunk.split('\n')[0].slice(0, 100);
+      const firstLine = previewLineWithHashtag(rawChunk);
       const retry = await postSendDocument(token, chatId, tmpPath, firstLine, null, replyTo);
       if (retry.ok) return { ok: true, fallback: true, messageId: assertMessageId(retry, 'markdown-file fallback') };
       throw new Error(`markdown-file fallback upload failed: ${retry.description ?? `HTTP ${retry.status}`}`);
@@ -523,7 +623,7 @@ async function sendTextToAdmin(token, chatId, text, opts) {
       throw new Error(`long-message file fallback failed to write tmp file: ${e instanceof Error ? e.message : String(e)}`);
     }
     try {
-      const firstLine = text.split('\n')[0].slice(0, 100);
+      const firstLine = previewLineWithHashtag(text);
       const res = await postSendDocument(token, chatId, tmpPath, firstLine, null, opts.replyTo ?? null);
       if (!res.ok) throw new Error(`long-message file fallback upload failed: ${res.description ?? `HTTP ${res.status}`}`);
       if (!res.messageId) throw new Error(`long-message file fallback: Telegram returned ok but no message_id — refusing to claim success`);
@@ -650,13 +750,15 @@ async function main() {
     const captionFromArgs = args.positional.join('\n').trim();
     const captionFromStdin = captionFromArgs ? '' : readStdinIfPiped().trim();
     const rawCaption = captionFromArgs || captionFromStdin || '';
-    const caption = projectCode && rawCaption ? `[${projectCode}] ${rawCaption}` : rawCaption;
+    // Caption is built per-chat below because convoId (used in hashtag) is
+    // resolved per-chat in the multi-admin fan-out.
 
     let failures = 0;
     let lastConvoId = null;
     for (const chatId of effectiveAdminIds) {
       try {
         let convoIdForSend = resolveConvoIdPreSend({ preResolved, replyTo: args.replyTo, chatId, botId });
+        const caption = injectConvoHash(rawCaption, projectCode, convoIdForSend, { pretokensEscaped: opts.raw });
         const { fallback, messageId } = await sendDocumentToAdmin(token, chatId, args.filePath, caption, opts);
         if (convoIdForSend == null) convoIdForSend = messageId; // new convo
         appendToSentRegistry({ messageId, chatId, botId, convoId: convoIdForSend });
@@ -683,15 +785,15 @@ async function main() {
 
   const argText = args.positional.join(' ').trim();
   const rawMessage = (argText || readStdinIfPiped()).trim();
-  const message = projectCode && rawMessage ? `[${projectCode}] ${rawMessage}` : rawMessage;
-  if (!message) {
+  if (!rawMessage) {
     console.error(
-      'Usage:\n' +
-        '  npm run tele -- "<markdown>"\n' +
-        '  npm run tele -- --raw "pre-escaped MdV2"\n' +
-        '  npm run tele -- --plain "no markdown"\n' +
-        '  npm run tele -- --file <path> ["caption"]\n' +
-        '  cat msg.md | npm run tele',
+      'Usage: node ../teleport/scripts/send-telegram.mjs [args]\n\n' +
+        'args:\n' +
+        '  "<markdown>"            MarkdownV2 message (default)\n' +
+        '  --raw "<text>"          pre-escaped MdV2, no extra escaping\n' +
+        '  --plain "<text>"        plain text, no markdown parsing\n' +
+        '  --file <path> [caption] send file as document\n' +
+        '  (or pipe via stdin)',
     );
     process.exit(1);
   }
@@ -701,6 +803,7 @@ async function main() {
   for (const chatId of effectiveAdminIds) {
     try {
       let convoIdForSend = resolveConvoIdPreSend({ preResolved, replyTo: args.replyTo, chatId, botId });
+      const message = injectConvoHash(rawMessage, projectCode, convoIdForSend, { pretokensEscaped: opts.raw });
       const { fallback, messageId, allMessageIds } = await sendTextToAdmin(token, chatId, message, opts);
       if (convoIdForSend == null) convoIdForSend = messageId; // new convo
       for (const mid of allMessageIds) appendToSentRegistry({ messageId: mid, chatId, botId, convoId: convoIdForSend });

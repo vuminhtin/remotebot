@@ -10,8 +10,9 @@
 
 ## Content format
 
+What you type:
 ```
-[Project] <emoji> *<Agent> on <topic>:*
+<emoji> *<Agent> on <topic>:*
 
 ✅ done
 
@@ -20,6 +21,22 @@
 ⬜ skipped
 ```
 
+What admin receives (script auto-prepends `[<project>]` and clickable convo hashtag):
+```
+[<project>] [<emoji> #c<convoId>] *<Agent> on <topic>:*
+
+✅ done
+
+✅ another done
+
+⬜ skipped
+```
+
+- `<project>` is auto-derived from `basename(process.cwd())` (or `TELE_PROJECT_CODE` env). `<convoId>` is the convo identifier resolved per-send.
+- **You do NOT type the `[<project>]` prefix or `#c<convoId>` hashtag** — `send-telegram.mjs` injects both. Just type the emoji + topic line as before.
+- **Why the hashtag:** Telegram makes `#c<id>` clickable; admin taps it to filter every message of one convo across multiple concurrent threads. The leading `c` is required — Telegram does NOT render pure-numeric `#1234` as clickable (hashtags must contain at least one letter). `c` = shortest mnemonic for "convo".
+- **convoId is truncated to last 7 chars** (`CONVO_HASH_MAX_LEN`) so Claude/Codex's 16-digit env-derived ids don't bloat the message header. Gemini's short ids are kept as-is. Collision risk between concurrently-active convos remains negligible at 7 digits.
+- **First send of a brand-new convo** (no `CLAUDE_CODE_SESSION_ID` / `CODEX_THREAD_ID` env, no `--convo`, no `--reply-to`): convoId equals the messageId of that very send, so the FIRST message has no hashtag; subsequent sends do.
 - **One blank line between items.** MarkdownV2 treats single `\n` as soft break (one wrapped paragraph) — `\n\n` for hard break. For noisy logs use `--plain` (Telegram skips parsing, every `\n` is a break).
 - **Target < 320 chars.** Don't paste diffs/logs.
 - **Agent:** `Claude` / `Codex` / `Gemini CLI` / `Antigravity` / `Cursor` / `<Other>`.
