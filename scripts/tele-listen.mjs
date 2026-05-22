@@ -174,9 +174,14 @@ export function parseArgs(argv) {
   let convo = null;
   let legacyFilter = false;
   let watch = false;
+  let waitOnce = false;
   for (let i = 0; i < argv.length; i++) {
     if (argv[i] === '--watch') {
       watch = true;
+      continue;
+    }
+    if (argv[i] === '--wait-once') {
+      waitOnce = true;
       continue;
     }
     if (argv[i] === '--legacy-filter') {
@@ -220,7 +225,13 @@ export function parseArgs(argv) {
   if (watch && filterReplyTo != null) {
     throw new Error('--watch is convo-mode only; --filter-reply-to not supported in watch mode');
   }
-  return { filterReplyTo, offsetFile, offsetFileProvided, convo, legacyFilter, watch };
+  if (waitOnce && filterReplyTo != null) {
+    throw new Error('--wait-once is convo-mode only; --filter-reply-to not supported in wait-once mode');
+  }
+  if (watch && waitOnce) {
+    throw new Error('--watch and --wait-once are mutually exclusive');
+  }
+  return { filterReplyTo, offsetFile, offsetFileProvided, convo, legacyFilter, watch, waitOnce };
 }
 
 // extractBotId is imported from send-telegram.mjs (single source of truth).
@@ -550,13 +561,12 @@ export function resolveStartOffset(
   offsetFile,
   globalOffsetFile = GLOBAL_OFFSET_FILE,
   cacheFile = UPDATES_CACHE_FILE,
-  seedFloor = 0,
 ) {
   const perLoop = readOffset(offsetFile);
   if (perLoop > 0) return perLoop;
 
   const globalOffset = readOffset(globalOffsetFile);
-  let startOffset = Math.max(globalOffset, seedFloor);
+  let startOffset = globalOffset;
 
   // If the cache has entries older than globalOffset, prefer the oldest cached
   // update_id so we don't miss updates that other loops have already pulled in.
@@ -580,10 +590,11 @@ export function resolveStartOffset(
       Infinity,
     );
     if (Number.isFinite(minCached) && minCached > 0 && (startOffset === 0 || minCached < startOffset)) {
-      // seedFloor (e.g. globalOffset for a brand-new --convo) takes precedence
-      // over cache-min: a new convo must NOT replay updates that landed before
-      // it was allocated.
-      startOffset = Math.max(seedFloor, minCached);
+      // A fresh convo listener deliberately replays everything still in the
+      // shared cache that matches its filter. That lets a restarted convo pick
+      // up replies fetched by another loop. Cache pruning bounds the replay
+      // window to the retained cache (currently 500 updates).
+      startOffset = minCached;
     }
   }
 
@@ -1294,7 +1305,6 @@ async function main() {
     offsetFile,
     GLOBAL_OFFSET_FILE,
     UPDATES_CACHE_FILE,
-    0,
   );
 
   // Read from local cache using per-loop offset.
@@ -1383,6 +1393,7 @@ async function main() {
 //       2 (no match / superseded / processing) → sleep 5s.
 //   - SIGTERM/SIGINT forwarded to the current child and supervisor exits.
 const BACKOFF_MS = { success: 0, noMatch: 5000, error: 12000, promptExists: 2000 };
+const WAIT_ONCE_MAX_FAILURES = 20;
 // Singleton lock for the watcher supervisor. Agents may invoke `--watch`
 // after every send; without this guard each invocation
 // would spawn a redundant supervisor → many parallel watchers polling the
@@ -1432,12 +1443,12 @@ function isWatcherLockHolderAlive(body) {
   }
   return true; // legacy v1 bare-PID: best-effort
 }
-async function acquireWatcherSingletonLock(convo) {
+async function acquireConvoSingletonLock(convo, { kind, logPrefix }) {
   fs.mkdirSync(DEFAULT_TMP_DIR, { recursive: true });
-  const lockFile = path.join(DEFAULT_TMP_DIR, `watcher-convo-${convo}.lock`);
+  const lockFile = path.join(DEFAULT_TMP_DIR, `${kind}-convo-${convo}.lock`);
   const myStartTime = getProcessStartTime(process.pid);
   if (!myStartTime) {
-    console.error('[tele-watch] WARNING: could not capture own startTime; falling back to PID-only v1 lock body');
+    console.error(`[${logPrefix}] WARNING: could not capture own startTime; falling back to PID-only v1 lock body`);
   }
   const body = myStartTime
     ? `${WATCHER_LOCK_BODY_VERSION}\n${process.pid}\n${myStartTime}`
@@ -1456,7 +1467,7 @@ async function acquireWatcherSingletonLock(convo) {
       const verify = fs.readFileSync(lockFile, 'utf8').trim();
       if (verify !== body) {
         const pidStr = (verify.split('\n')[0] || '?');
-        console.log(`[tele-watch] lost race after reap; another watcher (pid ${pidStr}) won for convo ${convo}; exiting`);
+        console.log(`[${logPrefix}] lost race after reap; another ${kind} process (pid ${pidStr}) won for convo ${convo}; exiting`);
         return null;
       }
       return lockFile;
@@ -1471,7 +1482,7 @@ async function acquireWatcherSingletonLock(convo) {
       } catch {}
       if (!mtimeStale && isWatcherLockHolderAlive(existing)) {
         const pidStr = (existing.split('\n').find((l) => /^\d+$/.test(l)) || '?');
-        console.log(`[tele-watch] another watcher (pid ${pidStr}) is already running for convo ${convo}; exiting`);
+        console.log(`[${logPrefix}] another ${kind} process (pid ${pidStr}) is already running for convo ${convo}; exiting`);
         return null;
       }
       // Reap the stale lock atomically: re-read immediately before unlinking.
@@ -1485,8 +1496,16 @@ async function acquireWatcherSingletonLock(convo) {
       await new Promise((r) => setTimeout(r, 20 + Math.floor(Math.random() * 30)));
     }
   }
-  console.log(`[tele-watch] could not acquire singleton lock for convo ${convo} after ${MAX_ATTEMPTS} attempts; exiting`);
+  console.log(`[${logPrefix}] could not acquire singleton lock for convo ${convo} after ${MAX_ATTEMPTS} attempts; exiting`);
   return null;
+}
+
+async function acquireWatcherSingletonLock(convo) {
+  return acquireConvoSingletonLock(convo, { kind: 'watcher', logPrefix: 'tele-watch' });
+}
+
+async function acquireWaitOnceSingletonLock(convo) {
+  return acquireConvoSingletonLock(convo, { kind: 'wait-once', logPrefix: 'tele-wait-once' });
 }
 
 // Read what's currently in the lock file — used to capture "our body" so the
@@ -1651,12 +1670,151 @@ async function watchSupervisor(argv) {
   console.log(`[tele-watch] supervisor exiting`);
 }
 
+export async function waitOnceSupervisor(argv, deps = {}) {
+  const spawnFn = deps.spawn ?? spawn;
+  const sleepFn = deps.sleep ?? ((ms) => new Promise((r) => setTimeout(r, ms)));
+  const exitFn = deps.exit ?? ((code) => process.exit(code));
+  const logFn = deps.log ?? ((msg) => console.log(msg));
+  const errorFn = deps.error ?? ((msg) => console.error(msg));
+  const existsFn = deps.exists ?? ((file) => fs.existsSync(file));
+  const acquireLockFn = deps.acquireLock ?? acquireWaitOnceSingletonLock;
+  const args = parseArgs(argv);
+  if (args.convo == null) {
+    const r = resolveConvoIdFromEnv({ argConvo: null });
+    if (r.convoId == null) {
+      errorFn('[tele-listen] --wait-once requires --convo <N> or a native session env var');
+      exitFn(1);
+      return;
+    }
+    args.convo = r.convoId;
+  }
+  const promptFile = path.join(DEFAULT_TMP_DIR, `prompt-convo-${args.convo}.json`);
+  let singletonLock = null;
+  let failureCount = 0;
+  while (singletonLock == null) {
+    if (existsFn(promptFile)) {
+      logFn(`[tele-wait-once] prompt ready: ${promptFile}`);
+      exitFn(0);
+      return;
+    }
+    singletonLock = await acquireLockFn(args.convo);
+    if (singletonLock == null) {
+      failureCount += 1;
+      if (failureCount >= WAIT_ONCE_MAX_FAILURES) {
+        errorFn(`[tele-wait-once] could not acquire singleton lock for convo ${args.convo} after ${failureCount} attempts`);
+        exitFn(1);
+        return;
+      }
+      await sleepFn(BACKOFF_MS.noMatch);
+    }
+  }
+  const ourBody = await readOurLockBody(singletonLock);
+  let currentChild = null;
+  let stopping = false;
+  let released = false;
+  const releaseSingleton = () => {
+    if (released) return;
+    released = true;
+    try {
+      const current = fs.readFileSync(singletonLock, 'utf8').trim();
+      if (current !== ourBody) return;
+      fs.unlinkSync(singletonLock);
+    } catch {}
+  };
+  const finish = (code) => {
+    releaseSingleton();
+    exitFn(code);
+  };
+  process.on('exit', releaseSingleton);
+  const SIGNAL_GRACE_MS = 5000;
+  for (const sig of ['SIGINT', 'SIGTERM']) {
+    process.on(sig, () => {
+      if (stopping) return;
+      stopping = true;
+      logFn(`[tele-wait-once] received ${sig}; forwarding to child + exiting (grace ${SIGNAL_GRACE_MS}ms)`);
+      const childStillRunning = currentChild != null
+        && currentChild.exitCode == null && currentChild.signalCode == null;
+      if (childStillRunning) {
+        try { currentChild.kill(sig); } catch {}
+        setTimeout(() => {
+          const stillRunning = currentChild != null
+            && currentChild.exitCode == null && currentChild.signalCode == null;
+          if (stillRunning) {
+            errorFn('[tele-wait-once] child did not exit within grace period; SIGKILL + force exit');
+            try { currentChild.kill('SIGKILL'); } catch {}
+          }
+          finish(1);
+        }, SIGNAL_GRACE_MS);
+      } else {
+        finish(0);
+      }
+    });
+  }
+  const childArgs = [process.argv[1], '--convo', String(args.convo)];
+  const childOffsetFile = args.offsetFileProvided
+    ? args.offsetFile
+    // --wait-once intentionally keeps a stable offset distinct from --watch's
+    // PPID-scoped offset. Repeated synchronous invocations must not replay a
+    // prompt they already consumed, while --watch can keep its own loop state.
+    : path.join(DEFAULT_TMP_DIR, `convo-${args.convo}-wait-once-offset.txt`);
+  childArgs.push('--offset-file', childOffsetFile);
+
+  logFn(`[tele-wait-once] waiting for one reply in convo ${args.convo}`);
+  while (true) {
+    if (stopping) return;
+    if (existsFn(promptFile)) {
+      logFn(`[tele-wait-once] prompt ready: ${promptFile}`);
+      finish(0);
+      return;
+    }
+    const exitCode = await new Promise((resolve) => {
+      const child = spawnFn(process.execPath, childArgs, {
+        stdio: 'inherit',
+        env: process.env,
+      });
+      currentChild = child;
+      child.on('exit', (code) => { currentChild = null; resolve(code ?? 1); });
+      child.on('error', (e) => {
+        currentChild = null;
+        errorFn(`[tele-wait-once] child spawn failed: ${e instanceof Error ? e.message : String(e)}`);
+        resolve(1);
+      });
+    });
+    if (stopping) return;
+    if (exitCode === 0) {
+      if (existsFn(promptFile)) {
+        logFn(`[tele-wait-once] prompt ready: ${promptFile}`);
+        finish(0);
+        return;
+      }
+      errorFn(`[tele-wait-once] child exited 0 but prompt was missing: ${promptFile}; continuing`);
+      failureCount += 1;
+    } else if (exitCode === 1) {
+      failureCount += 1;
+    } else {
+      failureCount = 0;
+    }
+    if (failureCount >= WAIT_ONCE_MAX_FAILURES) {
+      errorFn(`[tele-wait-once] giving up after ${failureCount} consecutive infrastructure failures`);
+      finish(1);
+      return;
+    }
+    const sleepMs = exitCode === 2 ? BACKOFF_MS.noMatch : BACKOFF_MS.error;
+    await sleepFn(sleepMs);
+  }
+}
+
 const isDirectRun = fileURLToPath(import.meta.url) === path.resolve(process.argv[1] ?? '');
 if (isDirectRun) {
   const argv = process.argv.slice(2);
   if (argv.includes('--watch')) {
     watchSupervisor(argv).catch((e) => {
       console.error(`[tele-watch] ${e instanceof Error ? e.message : String(e)}`);
+      process.exit(1);
+    });
+  } else if (argv.includes('--wait-once')) {
+    waitOnceSupervisor(argv).catch((e) => {
+      console.error(`[tele-wait-once] ${e instanceof Error ? e.message : String(e)}`);
       process.exit(1);
     });
   } else {

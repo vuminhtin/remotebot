@@ -95,17 +95,25 @@ Monitor({
 })
 ```
 
-**Other agents (foreground loop + `--watch`):** start a foreground watcher and keep the agent turn active.
+**Other agents choose by shell behavior:**
+
+Interactive streaming shells (like Codex) can keep a foreground watcher open:
 ```bash
 node ../teleport/scripts/tele-listen.mjs --watch --convo $CONVO_ID
 ```
-The supervisor loops internally: poll → write `prompt-convo-<N>.json` → wait until the file is deleted (= agent consumed) → resume. Keep this command session open; do not rely on shell backgrounding with `&`, because some tool wrappers detach or reap background jobs silently. Stop it with Ctrl-C when the conversation is done.
+The supervisor loops internally: poll → write `prompt-convo-<N>.json` → wait until the file is deleted (= agent consumed) → resume. Keep this command session open; do not rely on shell backgrounding with `&`, because some tool wrappers detach or reap background jobs silently. Stop it with Ctrl-C when the conversation is done. If you accidentally backgrounded it, stop it with `pkill -f "tele-listen.*--watch.*--convo ${CONVO_ID}( |$)"`.
 
-After starting `--watch`:
+Buffered shells that return output only after command exit (like Gemini CLI) should wait for one prompt at a time:
+```bash
+node ../teleport/scripts/tele-listen.mjs --wait-once --convo $CONVO_ID
+```
+`--wait-once` polls internally until exactly one matching prompt is ready, prints the prompt path, then exits so the agent can read and handle it. Run it again after deleting the prompt if you need to keep listening.
+
+After starting `--watch` or `--wait-once`:
 - Do NOT end your turn / send a "final" or similar response while waiting for replies (most agent runtimes stop polling once the turn ends).
 - Capture the convoId from `[send-telegram] convo: <N>` stdout: `export CONVO_ID=<N>`.
-- Keep the turn active and poll the watcher command output until it prints `prompt written to .../prompt-convo-$CONVO_ID.json`, then read+reply+delete.
-- Loop: when prompt appears → read JSON → reply via send-telegram → delete the prompt file → loop.
+- Keep the turn active until the command prints `prompt written to .../prompt-convo-$CONVO_ID.json` or `prompt ready: .../prompt-convo-$CONVO_ID.json`, then read+reply+delete.
+- Loop: when prompt appears → read JSON → reply via send-telegram → delete the prompt file → loop. For `--wait-once`, re-run the same `--wait-once` command to wait for the next reply.
 - End the turn ONLY when the user explicitly requests to stop (e.g., "close connection", "end turn", "stop loop").
 - If the user says something ambiguous like "done", "ok", or "bye", DO NOT end the turn. Instead, ask for explicit confirmation (e.g., "Should I wait for further instructions, or are we finished here?") and wait for a clear confirmation before ending the turn.
 
@@ -139,7 +147,8 @@ Then delete the prompt JSON. Restart the listener (same command).
 
 **tele-listen.mjs:**
 - `--convo <N>` — explicit convoId (else read from env).
-- `--watch` — long-lived foreground supervisor. Loops: poll → write prompt → wait for consume → resume. Codex/Gemini MUST use this and keep the command session open.
+- `--watch` — long-lived foreground supervisor for interactive streaming shells (like Codex). Loops: poll → write prompt → wait for consume → resume.
+- `--wait-once` — synchronous one-prompt wait for buffered shells (like Gemini CLI). Loops internally until one prompt is ready, then exits.
 - `--filter-reply-to <IDS>` — legacy IDS-list mode. Errors if a native session env is set; pair with `--legacy-filter` to override.
 - `--legacy-filter` — opt-out of the legacy/env conflict check; requires `--filter-reply-to`.
 - `--offset-file <path>` — explicit offset file (auto-synthesised for convo mode).

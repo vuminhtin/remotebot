@@ -764,27 +764,42 @@ async function maybeRecordConvo({ convoId, messageId, chatId, botId }) {
 
 // Tailor the "now start a listener" reminder by detected agent:
 //   - Claude (CLAUDE_CODE_SESSION_ID set) → suggest Monitor tool.
-//   - Codex (CODEX_THREAD_ID set) → suggest --watch daemon (Codex's foreground
-//     dies when the turn ends; a one-shot until-loop is insufficient).
-//   - Other (Gemini / plain shell) → suggest --watch daemon too (Gemini's
-//     foreground wait is bounded ~5min).
+//   - Codex (CODEX_THREAD_ID set) → suggest --watch (Codex can keep an
+//     interactive command session open and poll output).
+//   - Other → show both --watch and --wait-once; unknown agents must choose
+//     based on whether their shell streams long-running output or buffers it.
 // Hint is best-effort; agent can override if it knows better. If env is
 // missing despite running Claude, the agent still has its Monitor tool.
-// Two cases:
+// Cases:
 //   1. Claude (CLAUDE_CODE_SESSION_ID set) → Monitor tool.
-//   2. Other → foreground --watch loop + don't end your turn.
+//   2. Codex (CODEX_THREAD_ID set) → foreground --watch loop.
+//   3. Other → generic --watch / --wait-once guidance.
 function listenerHintForCurrentAgent(convoId) {
   const convoArg = convoId != null ? ` --convo ${convoId}` : '';
   if (process.env.CLAUDE_CODE_SESSION_ID) {
     return `[send-telegram] ⚠️ Start a reply listener via Monitor: \`until node ../teleport/scripts/tele-listen.mjs${convoArg}; do sleep 12; done\``;
   }
+  if (process.env.CODEX_THREAD_ID) {
+    const lines = [
+      `[send-telegram] ⚠️ Start a foreground watcher: \`node ../teleport/scripts/tele-listen.mjs --watch${convoArg}\``,
+      `[send-telegram] ⚠️ Do NOT end your turn / send a "final" or similar response while waiting for replies.`,
+    ];
+    if (convoId != null) {
+      lines.push(
+        `[send-telegram]    Keep the command session open until it prints \`prompt written to .../prompt-convo-${convoId}.json\`.`,
+        `[send-telegram]    When the prompt appears: read JSON → reply via send-telegram → delete the JSON → loop.`,
+      );
+    }
+    return lines.join('\n');
+  }
   const lines = [
-    `[send-telegram] ⚠️ Start a foreground watcher: \`node ../teleport/scripts/tele-listen.mjs --watch${convoArg}\``,
+    `[send-telegram] ⚠️ If your shell streams long-running output: \`node ../teleport/scripts/tele-listen.mjs --watch${convoArg}\``,
+    `[send-telegram] ⚠️ If your shell returns only after command exit: \`node ../teleport/scripts/tele-listen.mjs --wait-once${convoArg}\``,
     `[send-telegram] ⚠️ Do NOT end your turn / send a "final" or similar response while waiting for replies.`,
   ];
   if (convoId != null) {
     lines.push(
-      `[send-telegram]    Keep the command session open until it prints \`prompt written to .../prompt-convo-${convoId}.json\`.`,
+      `[send-telegram]    --watch prints \`prompt written to .../prompt-convo-${convoId}.json\`; --wait-once exits after one prompt is ready.`,
       `[send-telegram]    When the prompt appears: read JSON → reply via send-telegram → delete the JSON → loop.`,
     );
   } else {
