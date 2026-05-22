@@ -11,7 +11,7 @@ import {
   resolveConvoIdFromEnv, uuidToConvoInt, validateConvoIdString,
 } from './convo-registry.mjs';
 import { appendToSentRegistry, escapeMarkdownV2, injectConvoHash, listenerHintForCurrentAgent, parseArgs as parseSendArgs, previewLineWithHashtag, readSentRegistry, shortConvoHash } from './send-telegram.mjs';
-import { parseArgs as parseListenArgs, compareSameConvo, filterAdminMessages, resolveStartOffset, waitOnceSupervisor } from './tele-listen.mjs';
+import { parseArgs as parseListenArgs, compareSameConvo, filterAdminMessages, findOrphanMessages, resolveStartOffset, waitOnceSupervisor } from './tele-listen.mjs';
 
 function tmpFile() {
   return path.join(os.tmpdir(), `convo-reg-test-${Date.now()}-${Math.random().toString(36).slice(2)}.jsonl`);
@@ -438,6 +438,48 @@ test('listenerHintForCurrentAgent — Claude uses Monitor', () => {
   assert.match(hint, /Monitor/);
   assert.match(hint, /tele-listen\.mjs --convo 123/);
   assert.doesNotMatch(hint, /--wait-once/);
+});
+
+test('findOrphanMessages — phantom topic-creation reply is treated as orphan (not user reply)', () => {
+  // Telegram sets reply_to_message → topic creation event for EVERY message in
+  // a topic. We must not let that phantom suppress orphan classification.
+  const updates = [{
+    update_id: 1,
+    message: {
+      message_id: 100,
+      chat: { id: 144242180, type: 'private' },
+      text: 'Tôi gõ trong topic không reply',
+      message_thread_id: 1915267,
+      is_topic_message: true,
+      reply_to_message: {
+        message_id: 99,
+        chat: { id: 144242180, type: 'private' },
+        forum_topic_created: { name: 'tea_game', icon_color: 7322096 },
+        is_topic_message: true,
+      },
+    },
+  }];
+  const orphans = findOrphanMessages(updates, ['144242180'], new Set());
+  assert.strictEqual(orphans.length, 1);
+  assert.strictEqual(orphans[0].msg.message_id, 100);
+});
+
+test('findOrphanMessages — real user reply (non-phantom) is NOT orphan', () => {
+  // Sanity check: regular reply still suppresses orphan classification.
+  const updates = [{
+    update_id: 2,
+    message: {
+      message_id: 200,
+      chat: { id: 144242180, type: 'private' },
+      text: 'reply text',
+      reply_to_message: {
+        message_id: 150,
+        // no forum_topic_created — this is a real user reply target
+      },
+    },
+  }];
+  const orphans = findOrphanMessages(updates, ['144242180'], new Set());
+  assert.strictEqual(orphans.length, 0);
 });
 
 test('filterAdminMessages — convo mode uses (chatId, messageId) pair', () => {

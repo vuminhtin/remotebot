@@ -531,7 +531,18 @@ export function findOrphanMessages(updates, adminIds, systemMsgIds = new Set()) 
     // Replies to system messages (warnings the bot itself sent) are still orphans
     // from any agent's perspective — no Monitor filter will match. Treat them as
     // orphans so the user gets a fresh 💔 + warning rather than silent drop.
-    if (msg.reply_to_message && !systemMsgIds.has(`${msg.chat.id}:${msg.reply_to_message.message_id}`)) return false;
+    //
+    // Forum topic phantom-reply: Telegram automatically sets `reply_to_message`
+    // to the topic-creation service message for EVERY message posted in a topic
+    // (regardless of whether the user actually tapped "reply"). The reliable
+    // signal that this is the phantom (not a real user reply) is the presence
+    // of `reply_to_message.forum_topic_created`. Ignore phantom-reply so direct
+    // typing inside a topic is correctly classified as orphan.
+    if (msg.reply_to_message
+        && !msg.reply_to_message.forum_topic_created
+        && !systemMsgIds.has(`${msg.chat.id}:${msg.reply_to_message.message_id}`)) {
+      return false;
+    }
     // Bot API 7.0+: quote-replies may surface reply info in external_reply when the
     // user quoted a fragment, even if reply_to_message is absent. Treat as non-orphan.
     if (msg.external_reply) return false;
