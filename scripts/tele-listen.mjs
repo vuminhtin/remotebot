@@ -4,7 +4,14 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { loadEnvFromFile, parseAdminChatIds, postReaction, sendTextChunk } from './send-telegram.mjs';
+import {
+  getTelegramAdminChatRaw,
+  getTelegramBotToken,
+  loadEnvFromFile,
+  parseAdminChatIds,
+  postReaction,
+  sendTextChunk,
+} from './send-telegram.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT_DIR = path.resolve(__dirname, '..');
@@ -798,13 +805,11 @@ async function main() {
   fs.mkdirSync(DEFAULT_TMP_DIR, { recursive: true });
 
   const envFromFile = loadEnvFromFile(ENV_FILE);
-  const token = process.env.REPORT_BOT_TOKEN || envFromFile.REPORT_BOT_TOKEN;
-  const adminIds = parseAdminChatIds(
-    process.env.TELEGRAM_ADMIN_CHAT_ID || envFromFile.TELEGRAM_ADMIN_CHAT_ID,
-  );
+  const token = getTelegramBotToken(process.env, envFromFile);
+  const adminIds = parseAdminChatIds(getTelegramAdminChatRaw(process.env, envFromFile));
 
   if (!token) {
-    console.error('[tele-listen] Missing REPORT_BOT_TOKEN');
+    console.error('[tele-listen] Missing REPORT_BOT_TOKEN / TELEGRAM_BOT_TOKEN');
     process.exit(1);
   }
 

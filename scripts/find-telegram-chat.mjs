@@ -2,7 +2,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { loadEnvFromFile, scrubToken } from './send-telegram.mjs';
+import { getTelegramBotToken, loadEnvFromFile, scrubToken } from './send-telegram.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT_DIR = path.resolve(__dirname, '..');
@@ -93,11 +93,11 @@ async function main() {
   }
 
   const env = loadEnvFromFile(ENV_FILE);
-  const token = process.env.REPORT_BOT_TOKEN || env.REPORT_BOT_TOKEN;
+  const token = getTelegramBotToken(process.env, env);
   const username = args.username || process.env.TELEGRAM_ADMIN_USERNAME || env.TELEGRAM_ADMIN_USERNAME || 'tinvu_hcm';
 
   if (!token) {
-    console.error('[find-telegram-chat] Chưa có REPORT_BOT_TOKEN trong .env.');
+    console.error('[find-telegram-chat] Chưa có REPORT_BOT_TOKEN / TELEGRAM_BOT_TOKEN trong .env.');
     console.error('[find-telegram-chat] Hãy copy .env.example thành .env, điền token từ BotFather, rồi chạy lại.');
     process.exit(1);
   }

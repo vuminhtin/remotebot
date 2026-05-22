@@ -29,10 +29,17 @@ Cấu hình Telegram dùng chung nằm tại:
 - Send script: \`${sendScript}\`
 - Listen script: \`${listenScript}\`
 - Inspect command script: \`${inspectScript}\`
+- PATH commands, nếu có: \`remotebot\`, \`tele\`, \`tg\`, \`telegram\`
 
 Không được trả lời rằng workspace hiện tại không có Telegram token/chat ID. Token và chat ID đã được cấu hình tập trung trong \`${path.join(rootDir, '.env')}\`. Không yêu cầu người dùng nhập lại BOT_TOKEN hoặc CHAT_ID.
 
 Cách gửi từ bất kỳ workspace nào:
+
+\`\`\`powershell
+remotebot --severity success "<nội dung ngắn>"
+\`\`\`
+
+Nếu command shim chưa có trong PATH thì dùng đường dẫn tuyệt đối:
 
 \`\`\`powershell
 node "${sendScript}" --severity success "<nội dung ngắn>"

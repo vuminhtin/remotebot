@@ -53,6 +53,26 @@ export function parseAdminChatIds(raw) {
     .filter((s) => s.length > 0);
 }
 
+export function getTelegramBotToken(envVars = process.env, fileEnv = {}) {
+  return envVars.REPORT_BOT_TOKEN ||
+    envVars.TELEGRAM_BOT_TOKEN ||
+    envVars.BOT_TOKEN ||
+    fileEnv.REPORT_BOT_TOKEN ||
+    fileEnv.TELEGRAM_BOT_TOKEN ||
+    fileEnv.BOT_TOKEN ||
+    '';
+}
+
+export function getTelegramAdminChatRaw(envVars = process.env, fileEnv = {}) {
+  return envVars.TELEGRAM_ADMIN_CHAT_ID ||
+    envVars.TELEGRAM_CHAT_ID ||
+    envVars.CHAT_ID ||
+    fileEnv.TELEGRAM_ADMIN_CHAT_ID ||
+    fileEnv.TELEGRAM_CHAT_ID ||
+    fileEnv.CHAT_ID ||
+    '';
+}
+
 export function appendToSentRegistry(messageId, chatId, registryFile = SENT_REGISTRY_FILE) {
   if (!messageId) return;
   const dir = path.dirname(registryFile);
@@ -632,23 +652,21 @@ async function sendDocumentToAdmin(token, chatId, filePath, caption, opts) {
 
 async function main() {
   const envFromFile = loadEnvFromFile(ENV_FILE);
-  const token = process.env.REPORT_BOT_TOKEN || envFromFile.REPORT_BOT_TOKEN;
+  const token = getTelegramBotToken(process.env, envFromFile);
   // Project code: TELE_PROJECT_CODE env override > basename(cwd). No project-local .env reading.
   const projectCode =
     process.env.TELE_PROJECT_CODE ||
     process.env.REPORT_BOT_PROJECT_CODE ||
     path.basename(process.cwd()) ||
     '';
-  const adminIds = parseAdminChatIds(
-    process.env.TELEGRAM_ADMIN_CHAT_ID || envFromFile.TELEGRAM_ADMIN_CHAT_ID,
-  );
+  const adminIds = parseAdminChatIds(getTelegramAdminChatRaw(process.env, envFromFile));
 
   if (!token) {
-    console.error('Missing REPORT_BOT_TOKEN in .env or process env.');
+    console.error('Missing REPORT_BOT_TOKEN / TELEGRAM_BOT_TOKEN in .env or process env.');
     process.exit(1);
   }
   if (adminIds.length === 0) {
-    console.error('Missing TELEGRAM_ADMIN_CHAT_ID in .env or process env.');
+    console.error('Missing TELEGRAM_ADMIN_CHAT_ID / TELEGRAM_CHAT_ID in .env or process env.');
     process.exit(1);
   }
 
@@ -768,8 +786,7 @@ async function main() {
 
 const isDirectRun = fileURLToPath(import.meta.url) === path.resolve(process.argv[1] ?? '');
 if (isDirectRun) {
-  const tokenForScrub =
-    process.env.REPORT_BOT_TOKEN || loadEnvFromFile(ENV_FILE).REPORT_BOT_TOKEN || '';
+  const tokenForScrub = getTelegramBotToken(process.env, loadEnvFromFile(ENV_FILE));
   main().catch((error) => {
     const raw = error instanceof Error ? error.message : String(error);
     console.error(`[send-telegram] ${scrubToken(raw, tokenForScrub)}`);

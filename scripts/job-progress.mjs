@@ -1,7 +1,13 @@
 #!/usr/bin/env node
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { loadEnvFromFile, parseAdminChatIds, scrubToken } from './send-telegram.mjs';
+import {
+  getTelegramAdminChatRaw,
+  getTelegramBotToken,
+  loadEnvFromFile,
+  parseAdminChatIds,
+  scrubToken,
+} from './send-telegram.mjs';
 import { getJob, readJobState, upsertJob, writeJobState } from '../src/jobs/store.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -132,14 +138,14 @@ async function main() {
   }
 
   const envFromFile = loadEnvFromFile(ENV_FILE);
-  const token = process.env.REPORT_BOT_TOKEN || envFromFile.REPORT_BOT_TOKEN;
-  const adminIds = parseAdminChatIds(process.env.TELEGRAM_ADMIN_CHAT_ID || envFromFile.TELEGRAM_ADMIN_CHAT_ID);
+  const token = getTelegramBotToken(process.env, envFromFile);
+  const adminIds = parseAdminChatIds(getTelegramAdminChatRaw(process.env, envFromFile));
   if (!token) {
-    console.error('[job-progress] Chưa có REPORT_BOT_TOKEN.');
+    console.error('[job-progress] Chưa có REPORT_BOT_TOKEN / TELEGRAM_BOT_TOKEN.');
     process.exit(1);
   }
   if (adminIds.length === 0) {
-    console.error('[job-progress] Chưa có TELEGRAM_ADMIN_CHAT_ID.');
+    console.error('[job-progress] Chưa có TELEGRAM_ADMIN_CHAT_ID / TELEGRAM_CHAT_ID.');
     process.exit(1);
   }
 

@@ -8,6 +8,8 @@ import {
   createButtonMeta,
   chunkMessage,
   escapeMarkdownV2,
+  getTelegramAdminChatRaw,
+  getTelegramBotToken,
   loadEnvFromFile,
   parseAdminChatIds,
   parseArgs,
@@ -36,6 +38,16 @@ test('loadEnvFromFile đọc key/value và bỏ qua comment', () => {
 
 test('parseAdminChatIds tách nhiều chat ID', () => {
   assert.deepEqual(parseAdminChatIds(' 123, -456 ,,789 '), ['123', '-456', '789']);
+});
+
+test('getTelegramBotToken nhận alias phổ biến', () => {
+  assert.equal(getTelegramBotToken({ TELEGRAM_BOT_TOKEN: 'a' }, {}), 'a');
+  assert.equal(getTelegramBotToken({}, { BOT_TOKEN: 'b' }), 'b');
+});
+
+test('getTelegramAdminChatRaw nhận alias phổ biến', () => {
+  assert.equal(getTelegramAdminChatRaw({ TELEGRAM_CHAT_ID: '1' }, {}), '1');
+  assert.equal(getTelegramAdminChatRaw({}, { CHAT_ID: '2' }), '2');
 });
 
 test('parseArgs nhận file, reply, raw, plain và text', () => {

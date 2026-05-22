@@ -78,9 +78,12 @@ Nếu muốn Codex dùng Remotebot từ mọi workspace, kể cả project khôn
 
 ```bash
 node scripts/install-codex-global.mjs --apply
+node scripts/install-windows-shims.mjs --apply
 ```
 
-Script sẽ cập nhật `%USERPROFILE%\.codex\AGENTS.md` bằng đường dẫn tuyệt đối tới `F:\projects\remotebot`. Sau đó các phiên Codex mới sẽ dùng chung token/chat ID trong `F:\projects\remotebot\.env`, không cần nhập lại.
+Script thứ nhất sẽ cập nhật `%USERPROFILE%\.codex\AGENTS.md` bằng đường dẫn tuyệt đối tới `F:\projects\remotebot`. Script thứ hai tạo các command `remotebot`, `tele`, `tg`, `telegram` trong `%APPDATA%\npm`, để phiên Codex khác có thể tìm thấy command global thay vì phải tự đoán đường dẫn script.
+
+Sau đó các phiên Codex mới sẽ dùng chung token/chat ID trong `F:\projects\remotebot\.env`, không cần nhập lại. Nếu session Codex đã mở trước khi cài, hãy restart session đó để nhận `AGENTS.md` và PATH mới.
 
 #### Agent khác
 
@@ -172,6 +175,20 @@ npm test
 
 ```bash
 npm run package:release
+```
+
+Cài lại command global trên Windows:
+
+```bash
+npm run install:codex-global
+npm run install:windows-shims
+```
+
+Sau khi cài shim, có thể gửi nhanh từ bất kỳ workspace nào:
+
+```bash
+tele --severity success "xong"
+remotebot health --section disk
 ```
 
 Cài hoặc cập nhật cấu hình Remotebot global cho Codex:

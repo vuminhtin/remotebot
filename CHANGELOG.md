@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.2.1 - 2026-05-22
+
+Global Codex compatibility fix.
+
+- Added `remotebot`, `tele`, `tg`, and `telegram` Windows command shims.
+- Added `scripts/remotebot-cli.mjs` as a single entrypoint for send/listen/progress/health/steward commands.
+- Added `scripts/install-windows-shims.mjs` and `npm run install:windows-shims`.
+- Updated Codex global instructions to prefer `remotebot --severity ...` while keeping absolute script fallback.
+- Added env alias support for `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`, `BOT_TOKEN`, and `CHAT_ID`.
+- Added parent workspace config at `F:\projects\AGENTS.md` during local installation so Codex workspaces under `F:\projects` can inherit Remotebot instructions.
+
 ## 0.2.0 - 2026-05-22
 
 Feature-complete Remotebot release after the 0.1.0 foundation.

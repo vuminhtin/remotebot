@@ -1,12 +1,14 @@
 {
   "name": "remotebot",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "private": true,
   "description": "Cầu nối Telegram cho AI coding agent.",
   "type": "module",
   "scripts": {
     "test": "node --test test/*.test.mjs",
-    "package:release": "node scripts/package-release.mjs"
+    "package:release": "node scripts/package-release.mjs",
+    "install:codex-global": "node scripts/install-codex-global.mjs --apply",
+    "install:windows-shims": "node scripts/install-windows-shims.mjs --apply"
   },
   "engines": {
     "node": ">=20"
