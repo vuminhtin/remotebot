@@ -14,6 +14,14 @@ const SENT_REGISTRY_FILE = path.join(__dirname, 'tmp', 'tele-reply', 'sent-regis
 // We chunk below the hard limits to leave headroom for escape-expansion.
 const MESSAGE_CHUNK_LIMIT = 4000;
 const CAPTION_LIMIT = 1024;
+const VALID_SEVERITIES = new Set(['info', 'success', 'warning', 'fatal', 'approval_required']);
+const DEFAULT_QUICK_ACTIONS = [
+  { text: 'Tiếp tục', action: 'continue' },
+  { text: 'Sửa lỗi test', action: 'fix_failed_tests' },
+  { text: 'Gửi log', action: 'send_last_log' },
+  { text: 'Dừng', action: 'stop' },
+];
+const DEFAULT_BUTTON_TTL_SECONDS = 24 * 60 * 60;
 
 export function loadEnvFromFile(filePath) {
   const result = {};
@@ -83,22 +91,149 @@ export async function postReaction(token, chatId, messageId, emoji = '👍') {
   return { ok: res.ok && body?.ok !== false, description: body?.description };
 }
 
+export function parsePositiveInt(value, flagName) {
+  const n = parseInt(value, 10);
+  if (isNaN(n) || String(n) !== String(value).trim() || n <= 0) {
+    throw new Error(`${flagName} must be a positive integer, got: ${value}`);
+  }
+  return n;
+}
+
+export function parseButtonSpec(spec) {
+  const raw = String(spec ?? '').trim();
+  const eq = raw.indexOf('=');
+  if (eq <= 0 || eq === raw.length - 1) {
+    throw new Error(`Button spec must be "Label=action", got: ${spec}`);
+  }
+  const text = raw.slice(0, eq).trim();
+  const action = raw.slice(eq + 1).trim();
+  if (!text) throw new Error(`Button label must not be empty: ${spec}`);
+  if (!/^[a-z][a-z0-9_]{0,40}$/.test(action)) {
+    throw new Error(`Button action must be lowercase snake_case, got: ${action}`);
+  }
+  return { text, action };
+}
+
+export function parseButtonList(raw) {
+  return String(raw ?? '')
+    .split(',')
+    .map((part) => part.trim())
+    .filter(Boolean)
+    .map(parseButtonSpec);
+}
+
+export function createButtonMeta({ now = Math.floor(Date.now() / 1000), ttlSeconds = DEFAULT_BUTTON_TTL_SECONDS, nonce = null, jobId = '' } = {}) {
+  return {
+    nonce: nonce || Math.random().toString(36).slice(2, 8),
+    exp: now + ttlSeconds,
+    jobId: String(jobId || '').trim(),
+  };
+}
+
+export function buildCallbackData(action, meta = {}) {
+  const { nonce, exp, jobId } = createButtonMeta(meta);
+  const base = `rb:v1:${action}:${nonce}:${exp}`;
+  return jobId ? `${base}:${jobId}` : base;
+}
+
+export function buildInlineKeyboard(buttons = [], opts = {}) {
+  if (!buttons.length) return null;
+  const rows = [];
+  for (let i = 0; i < buttons.length; i += 2) {
+    rows.push(buttons.slice(i, i + 2).map((button) => ({
+      text: button.text,
+      callback_data: buildCallbackData(button.action, opts),
+    })));
+  }
+  return { inline_keyboard: rows };
+}
+
 export function parseArgs(argv) {
-  const result = { filePath: null, positional: [], raw: false, plain: false, replyTo: null, react: null };
+  const result = {
+    filePath: null,
+    positional: [],
+    raw: false,
+    plain: false,
+    replyTo: null,
+    react: null,
+    severity: 'warning',
+    silent: false,
+    logTailPath: null,
+    lines: 20,
+    buttons: [],
+    jobId: '',
+    buttonTtl: DEFAULT_BUTTON_TTL_SECONDS,
+  };
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
-    if (arg === '--react') {
+    if (arg === '--severity') {
       const next = argv[i + 1];
-      if (!next) throw new Error('--react requires a message ID argument');
-      const n = parseInt(next, 10);
-      if (isNaN(n) || String(n) !== next.trim() || n <= 0) throw new Error(`--react must be a positive integer message ID, got: ${next}`);
-      result.react = n;
+      if (!next) throw new Error('--severity requires a value');
+      if (!VALID_SEVERITIES.has(next)) throw new Error(`--severity must be one of: ${Array.from(VALID_SEVERITIES).join(', ')}`);
+      result.severity = next;
       i++;
       continue;
     }
-    if (arg === '--file' || arg === '-file') {
+    if (arg === '--silent') {
+      result.silent = true;
+      continue;
+    }
+    if (arg === '--log-tail') {
       const next = argv[i + 1];
-      if (!next) throw new Error('--file requires a path argument');
+      if (!next) throw new Error('--log-tail requires a file path');
+      result.logTailPath = next;
+      i++;
+      continue;
+    }
+    if (arg === '--lines') {
+      const next = argv[i + 1];
+      if (!next) throw new Error('--lines requires a positive integer');
+      result.lines = parsePositiveInt(next, '--lines');
+      i++;
+      continue;
+    }
+    if (arg === '--quick-actions') {
+      result.buttons.push(...DEFAULT_QUICK_ACTIONS);
+      continue;
+    }
+    if (arg === '--button') {
+      const next = argv[i + 1];
+      if (!next) throw new Error('--button requires "Label=action"');
+      result.buttons.push(parseButtonSpec(next));
+      i++;
+      continue;
+    }
+    if (arg === '--job-id') {
+      const next = argv[i + 1];
+      if (!next) throw new Error('--job-id requires a value');
+      result.jobId = next;
+      i++;
+      continue;
+    }
+    if (arg === '--button-ttl') {
+      const next = argv[i + 1];
+      if (!next) throw new Error('--button-ttl requires seconds');
+      result.buttonTtl = parsePositiveInt(next, '--button-ttl');
+      i++;
+      continue;
+    }
+    if (arg === '--buttons') {
+      const next = argv[i + 1];
+      if (!next) throw new Error('--buttons requires "Label=action,Label=action"');
+      result.buttons.push(...parseButtonList(next));
+      i++;
+      continue;
+    }
+    if (arg === '--react') {
+      const next = argv[i + 1];
+      if (!next) throw new Error('--react requires a message ID argument');
+      result.react = parsePositiveInt(next, '--react');
+      i++;
+      continue;
+    }
+    if (arg === '--file' || arg === '-file' || arg === '--artifact') {
+      const next = argv[i + 1];
+      if (!next) throw new Error(`${arg} requires a path argument`);
       result.filePath = next;
       i++;
       continue;
@@ -106,9 +241,7 @@ export function parseArgs(argv) {
     if (arg === '--reply-to') {
       const next = argv[i + 1];
       if (!next) throw new Error('--reply-to requires a message ID argument');
-      const n = parseInt(next, 10);
-      if (isNaN(n) || String(n) !== next.trim() || n <= 0) throw new Error(`--reply-to must be a positive integer message ID, got: ${next}`);
-      result.replyTo = n;
+      result.replyTo = parsePositiveInt(next, '--reply-to');
       i++;
       continue;
     }
@@ -297,6 +430,31 @@ export function scrubToken(text, token) {
   return text.split(token).join('***');
 }
 
+export function shouldDisableNotification({ severity = 'warning', silent = false } = {}) {
+  return Boolean(silent || severity === 'info' || severity === 'success');
+}
+
+export function applySeverityMention(text, { severity = 'warning', fatalMention = '' } = {}) {
+  const mention = String(fatalMention || '').trim();
+  if (severity !== 'fatal' || !mention) return text;
+  if (text.startsWith(mention)) return text;
+  return `${mention}\n${text}`;
+}
+
+export function readLogTail(filePath, lines = 20) {
+  const raw = fs.readFileSync(filePath, 'utf8');
+  const allLines = raw.split(/\r?\n/);
+  if (allLines.length > 0 && allLines[allLines.length - 1] === '') allLines.pop();
+  const selected = allLines.slice(-lines).join('\n').trim();
+  return selected || '(log trống)';
+}
+
+export function appendLogTail(message, filePath, lines = 20) {
+  const tail = readLogTail(filePath, lines);
+  const prefix = message ? `${message}\n\n` : '';
+  return `${prefix}Log tail (${lines} dòng):\n\`\`\`\n${tail}\n\`\`\``;
+}
+
 export function buildTempMarkdownFileName(now = new Date(), pid = process.pid) {
   const stamp = now.toISOString().replace(/[:.]/g, '-');
   return `telegram-report-${stamp}-${pid}.md`;
@@ -314,9 +472,11 @@ export function createTempMarkdownFile(content, tmpDir = os.tmpdir()) {
   return filePath;
 }
 
-async function postSendMessage(token, chatId, text, parseMode, replyToMessageId) {
+async function postSendMessage(token, chatId, text, parseMode, replyToMessageId, opts = {}) {
   const payload = { chat_id: chatId, text };
   if (parseMode) payload.parse_mode = parseMode;
+  if (opts.disableNotification) payload.disable_notification = true;
+  if (opts.replyMarkup) payload.reply_markup = opts.replyMarkup;
   if (replyToMessageId != null) {
     payload.reply_parameters = { message_id: replyToMessageId, allow_sending_without_reply: true };
   }
@@ -334,9 +494,11 @@ async function postSendMessage(token, chatId, text, parseMode, replyToMessageId)
   };
 }
 
-async function postSendDocument(token, chatId, filePath, caption, parseMode, replyToMessageId) {
+async function postSendDocument(token, chatId, filePath, caption, parseMode, replyToMessageId, opts = {}) {
   const form = new FormData();
   form.append('chat_id', String(chatId));
+  if (opts.disableNotification) form.append('disable_notification', 'true');
+  if (opts.replyMarkup) form.append('reply_markup', JSON.stringify(opts.replyMarkup));
   const data = fs.readFileSync(filePath);
   form.append('document', new Blob([data]), path.basename(filePath));
   if (caption) {
@@ -357,7 +519,8 @@ async function postSendDocument(token, chatId, filePath, caption, parseMode, rep
  * the admin still receives the content with its markdown source intact
  * (readable in Telegram's file preview), instead of collapsing to plain text.
  */
-export async function sendTextChunk(token, chatId, rawChunk, { raw, plain, replyTo = null }) {
+export async function sendTextChunk(token, chatId, rawChunk, opts = {}) {
+  const { raw, plain, replyTo = null } = opts;
   // Helper: refuse to claim success if Telegram returned ok with no message_id.
   // The agent relies on the printed messageId to start its reply listener; a
   // silent miss would log a successful send but leave the agent unable to
@@ -368,12 +531,12 @@ export async function sendTextChunk(token, chatId, rawChunk, { raw, plain, reply
   };
 
   if (plain) {
-    const res = await postSendMessage(token, chatId, rawChunk, null, replyTo);
+    const res = await postSendMessage(token, chatId, rawChunk, null, replyTo, opts);
     if (res.ok) return { ok: true, fallback: false, messageId: assertMessageId(res, 'plain send') };
     throw new Error(res.description ?? `HTTP ${res.status}`);
   }
   const payload = raw ? rawChunk : escapeMarkdownV2(rawChunk);
-  const first = await postSendMessage(token, chatId, payload, 'MarkdownV2', replyTo);
+  const first = await postSendMessage(token, chatId, payload, 'MarkdownV2', replyTo, opts);
   if (first.ok) return { ok: true, fallback: false, messageId: assertMessageId(first, 'markdown send') };
 
   const desc = first.description ?? `HTTP ${first.status}`;
@@ -386,7 +549,7 @@ export async function sendTextChunk(token, chatId, rawChunk, { raw, plain, reply
     }
     try {
       const firstLine = rawChunk.split('\n')[0].slice(0, 100);
-      const retry = await postSendDocument(token, chatId, tmpPath, firstLine, null, replyTo);
+      const retry = await postSendDocument(token, chatId, tmpPath, firstLine, null, replyTo, opts);
       if (retry.ok) return { ok: true, fallback: true, messageId: assertMessageId(retry, 'markdown-file fallback') };
       throw new Error(`markdown-file fallback upload failed: ${retry.description ?? `HTTP ${retry.status}`}`);
     } finally {
@@ -418,7 +581,7 @@ async function sendTextToAdmin(token, chatId, text, opts) {
     }
     try {
       const firstLine = text.split('\n')[0].slice(0, 100);
-      const res = await postSendDocument(token, chatId, tmpPath, firstLine, null, opts.replyTo ?? null);
+      const res = await postSendDocument(token, chatId, tmpPath, firstLine, null, opts.replyTo ?? null, opts);
       if (!res.ok) throw new Error(`long-message file fallback upload failed: ${res.description ?? `HTTP ${res.status}`}`);
       if (!res.messageId) throw new Error(`long-message file fallback: Telegram returned ok but no message_id — refusing to claim success`);
       return {
@@ -455,12 +618,12 @@ async function sendDocumentToAdmin(token, chatId, filePath, caption, opts) {
       parseMode = 'MarkdownV2';
     }
   }
-  const first = await postSendDocument(token, chatId, filePath, finalCaption, parseMode, opts.replyTo);
+  const first = await postSendDocument(token, chatId, filePath, finalCaption, parseMode, opts.replyTo, opts);
   if (first.ok) return { fallback: false, messageId: first.messageId };
 
   const desc = first.description ?? `HTTP ${first.status}`;
   if (parseMode && /can't parse entities|can\u2019t parse entities/i.test(desc)) {
-    const retry = await postSendDocument(token, chatId, filePath, caption.slice(0, CAPTION_LIMIT), null, opts.replyTo);
+    const retry = await postSendDocument(token, chatId, filePath, caption.slice(0, CAPTION_LIMIT), null, opts.replyTo, opts);
     if (retry.ok) return { fallback: true, messageId: retry.messageId };
     throw new Error(retry.description ?? `HTTP ${retry.status}`);
   }
@@ -497,7 +660,14 @@ async function main() {
     process.exit(1);
   }
 
-  const opts = { raw: args.raw, plain: args.plain, replyTo: args.replyTo };
+  const opts = {
+    raw: args.raw,
+    plain: args.plain,
+    replyTo: args.replyTo,
+    severity: args.severity,
+    disableNotification: shouldDisableNotification({ severity: args.severity, silent: args.silent }),
+    replyMarkup: buildInlineKeyboard(args.buttons, { ttlSeconds: args.buttonTtl, jobId: args.jobId }),
+  };
 
   if (args.react != null) {
     let failures = 0;
@@ -523,7 +693,12 @@ async function main() {
     }
     const captionFromArgs = args.positional.join('\n').trim();
     const captionFromStdin = captionFromArgs ? '' : readStdinIfPiped().trim();
-    const rawCaption = captionFromArgs || captionFromStdin || '';
+    let rawCaption = captionFromArgs || captionFromStdin || '';
+    if (args.logTailPath) rawCaption = appendLogTail(rawCaption, args.logTailPath, args.lines);
+    rawCaption = applySeverityMention(rawCaption, {
+      severity: args.severity,
+      fatalMention: process.env.TELEGRAM_FATAL_MENTION || envFromFile.TELEGRAM_FATAL_MENTION,
+    });
     const caption = projectCode && rawCaption ? `[${projectCode}] ${rawCaption}` : rawCaption;
 
     let failures = 0;
@@ -548,7 +723,12 @@ async function main() {
   }
 
   const argText = args.positional.join(' ').trim();
-  const rawMessage = (argText || readStdinIfPiped()).trim();
+  let rawMessage = (argText || readStdinIfPiped()).trim();
+  if (args.logTailPath) rawMessage = appendLogTail(rawMessage, args.logTailPath, args.lines);
+  rawMessage = applySeverityMention(rawMessage, {
+    severity: args.severity,
+    fatalMention: process.env.TELEGRAM_FATAL_MENTION || envFromFile.TELEGRAM_FATAL_MENTION,
+  });
   const message = projectCode && rawMessage ? `[${projectCode}] ${rawMessage}` : rawMessage;
   if (!message) {
     console.error(
@@ -557,6 +737,8 @@ async function main() {
         '  npm run tele -- --raw "pre-escaped MdV2"\n' +
         '  npm run tele -- --plain "no markdown"\n' +
         '  npm run tele -- --file <path> ["caption"]\n' +
+        '  npm run tele -- --severity fatal --log-tail <path> --lines 20 "failed"\n' +
+        '  npm run tele -- --quick-actions "need decision"\n' +
         '  cat msg.md | npm run tele',
     );
     process.exit(1);

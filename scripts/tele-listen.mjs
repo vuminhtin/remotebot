@@ -75,6 +75,7 @@ export const UPDATES_CACHE_FILE = path.join(DEFAULT_TMP_DIR, 'updates-cache.json
 export const POLL_LOCK_FILE = path.join(DEFAULT_TMP_DIR, 'poll.lock');
 export const REGISTRY_FILE = path.join(DEFAULT_TMP_DIR, 'listener-registry.jsonl');
 export const REGISTRY_LOCK_FILE = path.join(DEFAULT_TMP_DIR, 'registry.lock');
+export const PROCESSED_CALLBACKS_FILE = path.join(DEFAULT_TMP_DIR, 'processed-callbacks.jsonl');
 export const REGISTRY_MAX_ENTRIES = 100;
 const LOCK_STALE_MS = 30_000;
 
@@ -140,6 +141,17 @@ export async function fetchUpdates(token, offset) {
   return body.result;
 }
 
+export async function answerCallbackQuery(token, callbackQueryId, text = 'Đã nhận') {
+  const payload = { callback_query_id: callbackQueryId, text, show_alert: false };
+  const res = await fetch(`${TELEGRAM_API}${token}/answerCallbackQuery`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+  const body = await res.json().catch(() => ({}));
+  return { ok: res.ok && body?.ok !== false, description: body?.description };
+}
+
 export function parseArgs(argv) {
   let filterReplyTo = null;
   let offsetFile = DEFAULT_OFFSET_FILE;
@@ -184,6 +196,92 @@ export function filterAdminMessages(updates, adminIds, filterReplyTo = null) {
     .map((u) => ({ update: u, msg: u.message }));
 }
 
+export function parseCallbackData(data) {
+  const raw = String(data ?? '').trim();
+  const match = raw.match(/^rb:v1:([a-z][a-z0-9_]{0,40})(?::([A-Za-z0-9_-]{1,16}))?(?::(\d{1,12}))?(?::([A-Za-z0-9_-]{1,24}))?$/);
+  if (!match) return { action: raw, raw, valid: false, nonce: null, exp: null, jobId: null, expired: false };
+  const exp = match[3] ? Number(match[3]) : null;
+  const now = Math.floor(Date.now() / 1000);
+  return {
+    action: match[1],
+    raw,
+    valid: true,
+    nonce: match[2] ?? null,
+    exp,
+    jobId: match[4] ?? null,
+    expired: exp != null && exp < now,
+  };
+}
+
+export function filterAdminCallbacks(updates, adminIds, filterReplyTo = null) {
+  const replyToSet = filterReplyTo == null ? null
+    : Array.isArray(filterReplyTo) ? new Set(filterReplyTo)
+    : new Set([filterReplyTo]);
+  return updates
+    .filter((u) => {
+      const cq = u.callback_query;
+      if (!cq?.data || !cq.message) return false;
+      if (adminIds.length > 0 && !adminIds.includes(String(cq.message.chat.id))) return false;
+      if (adminIds.length > 0 && !adminIds.includes(String(cq.from?.id ?? cq.message.chat.id))) return false;
+      if (replyToSet != null && !replyToSet.has(cq.message.message_id)) return false;
+      return true;
+    })
+    .map((u) => ({ update: u, callbackQuery: u.callback_query, msg: buildCallbackPromptMessage(u.callback_query) }));
+}
+
+export function buildCallbackPromptMessage(callbackQuery) {
+  const parsed = parseCallbackData(callbackQuery.data);
+  const sourceMessage = callbackQuery.message;
+  return {
+    text: parsed.action,
+    message_id: sourceMessage.message_id,
+    date: sourceMessage.date ?? Math.floor(Date.now() / 1000),
+    chat: sourceMessage.chat,
+    from: callbackQuery.from ?? sourceMessage.chat,
+    reply_to_message: { message_id: sourceMessage.message_id },
+    _callbackQueryId: callbackQuery.id,
+    _callbackData: callbackQuery.data,
+    _callbackJobId: parsed.jobId,
+    _callbackExp: parsed.exp,
+    _callbackNonce: parsed.nonce,
+    _callbackValid: parsed.valid,
+  };
+}
+
+export function callbackProcessKey(callbackQuery) {
+  const parsed = parseCallbackData(callbackQuery.data);
+  return `${callbackQuery.message.chat.id}:${callbackQuery.message.message_id}:${parsed.action}:${parsed.nonce ?? 'no_nonce'}`;
+}
+
+export function readProcessedCallbackKeys(file = PROCESSED_CALLBACKS_FILE) {
+  let raw;
+  try { raw = fs.readFileSync(file, 'utf8'); } catch { return new Set(); }
+  const keys = new Set();
+  for (const line of raw.trim().split('\n')) {
+    if (!line) continue;
+    try {
+      const entry = JSON.parse(line);
+      if (entry.key) keys.add(entry.key);
+    } catch {}
+  }
+  return keys;
+}
+
+export function markCallbacksProcessed(entries, file = PROCESSED_CALLBACKS_FILE) {
+  const callbackEntries = entries.filter((entry) => entry.callbackQuery);
+  if (!callbackEntries.length) return;
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  const lines = callbackEntries.map((entry) => JSON.stringify({
+    key: callbackProcessKey(entry.callbackQuery),
+    callbackQueryId: entry.callbackQuery.id,
+    action: parseCallbackData(entry.callbackQuery.data).action,
+    chatId: String(entry.callbackQuery.message.chat.id),
+    messageId: entry.callbackQuery.message.message_id,
+    ts: Math.floor(Date.now() / 1000),
+  })).join('\n') + '\n';
+  fs.appendFileSync(file, lines, 'utf8');
+}
+
 export function buildPromptData(msg) {
   return {
     text: msg.text,
@@ -192,6 +290,10 @@ export function buildPromptData(msg) {
     fromUserId: String(msg.from?.id ?? msg.chat.id),
     replyToMessageId: msg.reply_to_message?.message_id ?? null,
     timestamp: msg.date,
+    callbackQueryId: msg._callbackQueryId ?? null,
+    callbackData: msg._callbackData ?? null,
+    callbackJobId: msg._callbackJobId ?? null,
+    callbackExp: msg._callbackExp ?? null,
   };
 }
 
@@ -216,6 +318,10 @@ export function buildCombinedPromptData(messages) {
     fromUserId: String(last.from?.id ?? last.chat.id),
     replyToMessageId: last.reply_to_message?.message_id ?? null,
     timestamp: last.date,
+    callbackQueryId: last._callbackQueryId ?? null,
+    callbackData: last._callbackData ?? null,
+    callbackJobId: last._callbackJobId ?? null,
+    callbackExp: last._callbackExp ?? null,
   };
 }
 
@@ -237,8 +343,20 @@ export function findOrphanMessages(updates, adminIds, systemMsgIds = new Set()) 
   }).map((u) => ({ update: u, msg: u.message, orphan: true }));
 }
 
-export function collectMessagesToProcess(updates, adminIds, filterReplyTo) {
-  return filterAdminMessages(updates, adminIds, filterReplyTo);
+export function collectMessagesToProcess(updates, adminIds, filterReplyTo, processedCallbackKeys = new Set()) {
+  const seenCallbackKeys = new Set();
+  const callbacks = filterAdminCallbacks(updates, adminIds, filterReplyTo).filter((entry) => {
+    const parsed = parseCallbackData(entry.callbackQuery.data);
+    if (parsed.expired) return false;
+    const key = callbackProcessKey(entry.callbackQuery);
+    if (processedCallbackKeys.has(key) || seenCallbackKeys.has(key)) return false;
+    seenCallbackKeys.add(key);
+    return true;
+  });
+  return [
+    ...filterAdminMessages(updates, adminIds, filterReplyTo),
+    ...callbacks,
+  ].sort((a, b) => a.update.update_id - b.update.update_id);
 }
 
 /**
@@ -419,6 +537,22 @@ export async function reactToMessages(token, messages) {
       if (attempt === 0) await new Promise(r => setTimeout(r, 5000));
     }
     if (!success) console.error(`[tele-listen] react gave up for ${msgId} after 2 attempts`);
+  }
+}
+
+export async function acknowledgeEntries(token, entries) {
+  for (const entry of entries) {
+    if (entry.callbackQuery?.id || entry.msg?._callbackQueryId) {
+      const callbackQueryId = entry.callbackQuery?.id || entry.msg._callbackQueryId;
+      try {
+        const { ok, description } = await answerCallbackQuery(token, callbackQueryId);
+        if (!ok) console.error(`[tele-listen] callback ack rejected for ${callbackQueryId}: ${description}`);
+      } catch (e) {
+        console.error(`[tele-listen] callback ack failed for ${callbackQueryId}: ${e instanceof Error ? e.message : String(e)}`);
+      }
+      continue;
+    }
+    await reactToMessages(token, [entry]);
   }
 }
 
@@ -741,17 +875,19 @@ async function main() {
             return JSON.stringify({
               ts: Math.floor(Date.now() / 1000),
               update_id: u.update_id,
-              message_id: m?.message_id ?? null,
-              from: m?.from?.id ?? null,
-              reply_to: m?.reply_to_message?.message_id ?? null,
-              has_text: Boolean(m?.text),
-              text_preview: m?.text ? m.text.slice(0, 60) : null,
+              message_id: m?.message_id ?? u.callback_query?.message?.message_id ?? null,
+              from: m?.from?.id ?? u.callback_query?.from?.id ?? null,
+              reply_to: m?.reply_to_message?.message_id ?? u.callback_query?.message?.message_id ?? null,
+              has_text: Boolean(m?.text || u.callback_query?.data),
+              text_preview: m?.text ? m.text.slice(0, 60) : u.callback_query?.data?.slice(0, 60) ?? null,
               update_type: m
                 ? 'message'
                 : u.edited_message
                   ? 'edited_message'
                   : u.message_reaction
                     ? 'message_reaction'
+                    : u.callback_query
+                      ? 'callback_query'
                     : Object.keys(u).filter((k) => k !== 'update_id')[0] ?? 'unknown',
               classification: kind,
             });
@@ -794,7 +930,24 @@ async function main() {
     process.exit(1);
   }
 
-  const toProcess = collectMessagesToProcess(updates, adminIds, filterReplyTo);
+  const processedCallbackKeys = readProcessedCallbackKeys();
+  const candidateCallbacks = filterAdminCallbacks(updates, adminIds, filterReplyTo);
+  for (const entry of candidateCallbacks) {
+    const parsed = parseCallbackData(entry.callbackQuery.data);
+    if (parsed.expired) {
+      try {
+        await answerCallbackQuery(token, entry.callbackQuery.id, 'Nút này đã hết hạn');
+      } catch {}
+      continue;
+    }
+    const key = callbackProcessKey(entry.callbackQuery);
+    if (!processedCallbackKeys.has(key)) continue;
+    try {
+      await answerCallbackQuery(token, entry.callbackQuery.id, 'Nút này đã được xử lý');
+    } catch {}
+  }
+
+  const toProcess = collectMessagesToProcess(updates, adminIds, filterReplyTo, processedCallbackKeys);
 
   const advanceLoopOffset = () => {
     if (updates.length > 0) {
@@ -811,8 +964,9 @@ async function main() {
   let data;
   data = buildCombinedPromptData(toProcess);
   writePromptAtomic(data, promptFile);
+  markCallbacksProcessed(toProcess);
   // React 👍 AFTER successful prompt write to avoid false ack on failure.
-  await reactToMessages(token, toProcess);
+  await acknowledgeEntries(token, toProcess);
   advanceLoopOffset();
   const preview = data.text.slice(0, 60);
   console.log(

@@ -1,0 +1,42 @@
+{
+  "allowedCommands": [
+    "continue",
+    "fix_failed_tests",
+    "stop",
+    "send_last_log",
+    "run_tests",
+    "summarize_status",
+    "health",
+    "disk",
+    "memory",
+    "processes",
+    "last_agent_status",
+    "capture_screenshot",
+    "service_log"
+  ],
+  "requirePinFor": [
+    "capture_screenshot",
+    "restart_service"
+  ],
+  "pinSha256": null,
+  "pinEnvVar": "REMOTEBOT_PIN",
+  "stewardServices": {
+    "example-worker": {
+      "logFile": "logs/example-worker.log",
+      "windowsServiceName": "ExampleWorker",
+      "systemdUnit": "example-worker.service"
+    }
+  },
+  "dangerousTextPatterns": [
+    "\\brm\\s+-rf\\b",
+    "\\bRemove-Item\\b.*\\b-Recurse\\b",
+    "\\brmdir\\b.*\\b/s\\b",
+    "\\bdel\\b.*\\b/s\\b",
+    "\\bgit\\s+reset\\s+--hard\\b",
+    "\\bgit\\s+clean\\b.*\\b-f\\b",
+    "\\bshutdown\\b",
+    "\\breboot\\b",
+    "\\bformat\\b"
+  ],
+  "auditFile": "scripts/tmp/remotebot-audit.jsonl"
+}
