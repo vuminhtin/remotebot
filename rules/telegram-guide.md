@@ -22,7 +22,7 @@
 
 - **One blank line between items.** MarkdownV2 treats single `\n` as soft break (one wrapped paragraph) — `\n\n` for hard break. For noisy logs use `--plain` (Telegram skips parsing, every `\n` is a break).
 - **Target < 320 chars.** Don't paste diffs/logs.
-- **Agent:** `Claude` / `Codex` / `Gemini` / `<Other>`.
+- **Agent:** `Claude` / `Codex` / `Gemini CLI` / `Antigravity` / `Cursor` / `<Other>`.
 - **Emoji:** random per-thread (collision-avoidance for concurrent convos). Pick once on first send; reuse for the lifetime of the thread. All agents must include one.
 - **Topic:** ≤ 9 words.
 - **Language:** match user's language; keep consistent in the thread. The "on" wording is the English form — translate.
@@ -60,16 +60,10 @@ node ../teleport/scripts/send-telegram.mjs --file <path> "caption"
 
 ## Convo identity
 
-`send-telegram.mjs` picks `convoId` per send (first non-null wins):
+To stay in the same thread, the agent must associate messages under a single conversation (`convoId`):
 
-1. `CLAUDE_CODE_SESSION_ID` / `CODEX_THREAD_ID` env → UUID hashed to int. Wins for the agent's whole session.
-2. `--convo <N>` flag — effective only when no native env (Gemini / other agents).
-3. `--reply-to <Y>` — if Y is a registered messageId for this `(botId, chatId)`, join that convo.
-4. Else allocate new convo: `convoId = messageId of this send`.
-
-**Claude / Codex:** nothing to do; native env wins for the session. `--convo` passed on the command line is silently ignored (env is more reliable).
-
-**Gemini / Antigravity / plain shell:** always `--reply-to <admin-or-own-prev-messageId>` to stay in the same convo. Forgetting `--reply-to` opens a new convo.
+1. **First send:** Send the message. Capture the convo ID from the stdout: `[send-telegram] convo: <N> messageId: <M>`.
+2. **Subsequent sends:** Always pass `--convo <convoId>` and `--reply-to <prompt.messageId>` (where `prompt` is the incoming user message JSON parsed from `tele-listen`) to stay in the same convo and visually reply to the user's message.
 
 Send stdout ends with:
 ```
@@ -131,29 +125,25 @@ Then delete the prompt JSON. Restart the listener (same command).
 
 **Two Monitors per convo = silent loss bug.** Always `TaskStop` the previous before starting a new one. Auto-supersede is a safety net but not a substitute.
 
-## Crash recovery
-
-`tele-listen` prints `convo <N> has no registered messages … Run: node …/import-convo.mjs --convo <N> --bot <id>` when `send-telegram` crashed mid-write. Run `import-convo.mjs` to repair from `sent-registry.jsonl`; offset is not advanced on this path, so replies are not lost.
 
 ## Flags
 
 **send-telegram.mjs:**
-- `--reply-to <messageId>` — Telegram reply to a specific message.
-- `--convo <N>` — explicit convoId (overrides --reply-to inference; env still wins).
-- `--file <path>` — send as document.
-- `--plain` — plain text, no markdown.
-- `--raw` — caller already escaped MarkdownV2.
+- `--convo <N>` — the ID of the conversation thread.
+- `--reply-to <messageId>` — the Telegram message ID to reply to.
+- `--file <path>` — send a file as a document.
+- `--plain` — send as plain text without Markdown parsing.
+- `--raw` — send pre-escaped MarkdownV2 text.
 - `--react <messageId>` — react 👍 to a message.
 
 **tele-listen.mjs:**
-- `--convo <N>` — explicit convoId (else read from env).
-- `--watch` — long-lived foreground supervisor for interactive streaming shells (like Codex). Loops: poll → write prompt → wait for consume → resume.
-- `--wait-once` — synchronous one-prompt wait for buffered shells (like Gemini CLI). Loops internally until one prompt is ready, then exits.
-- `--filter-reply-to <IDS>` — legacy IDS-list mode. Errors if a native session env is set; pair with `--legacy-filter` to override.
-- `--legacy-filter` — opt-out of the legacy/env conflict check; requires `--filter-reply-to`.
-- `--offset-file <path>` — explicit offset file (auto-synthesised for convo mode).
+- `--convo <N>` — the conversation thread ID to listen to.
+- `--watch` — start a long-running foreground supervisor (ideal for streaming shells like Codex).
+- `--wait-once` — poll until exactly one new reply is ready, then exit (ideal for buffered shells).
 
 ## Troubleshooting
 
-- `--filter-reply-to is incompatible with <env> env` → unset env OR drop `--filter-reply-to` OR pass `--legacy-filter`.
-- `convo <N> has no registered messages …` → send-telegram crashed before convo-registry append. Run `node import-convo.mjs --convo <N> --bot <id>` to repair from sent-registry.
+- `convo <N> has no registered messages …`: Run the repair command printed in the error message to restore the local session registry:
+  ```bash
+  node ../teleport/scripts/import-convo.mjs --convo <N> --bot <id>
+  ```
