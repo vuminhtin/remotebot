@@ -3,6 +3,43 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import {
+  acquireLock as acquireConvoLock,
+  appendRowLocked as appendConvoRow,
+  buildConvoFilter,
+  CONVO_ID_RE,
+  CONVO_SCHEMA_VERSION,
+  DEFAULT_LOCK_FILE as CONVO_LOCK_FILE,
+  DEFAULT_REGISTRY_FILE as CONVO_REGISTRY_FILE,
+  hasAllocationRow,
+  lookupConvoIdByMessageId,
+  pruneLocked as pruneConvoRegistry,
+  resolveConvoIdFromEnv,
+  readRows as readConvoRows,
+  REGISTRY_CAP as CONVO_REGISTRY_CAP,
+  releaseLock as releaseConvoLock,
+  validateConvoIdString,
+} from './convo-registry.mjs';
+import {
+  clearThreadId,
+  getThreadId,
+  isNoTopicSupportFresh,
+  readTopicsStore,
+  recordNoTopicSupport,
+  recordThreadId,
+  updateTopicsStore,
+  writeTopicsStore,
+} from './topics-store.mjs';
+import {
+  recordBotSend,
+  updatePendingStore,
+} from './pending-store.mjs';
+import { CONVO_HASH_LONG_LEN, shortConvoHash as _shortConvoHash } from './convo-hash.mjs';
+
+// Re-export so existing imports of `shortConvoHash` from send-telegram keep
+// working. Logic now lives in convo-hash.mjs (leaf, no circular deps).
+export { CONVO_HASH_LONG_LEN } from './convo-hash.mjs';
+export const shortConvoHash = _shortConvoHash;
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT_DIR = path.resolve(__dirname, '..');
@@ -10,18 +47,17 @@ const ENV_FILE = path.join(ROOT_DIR, '.env');
 const TELEGRAM_API = 'https://api.telegram.org/bot';
 const SENT_REGISTRY_FILE = path.join(__dirname, 'tmp', 'tele-reply', 'sent-registry.jsonl');
 
+export function extractBotId(token) {
+  if (!token || typeof token !== 'string') return null;
+  const head = token.split(':')[0];
+  if (!/^\d+$/.test(head)) return null;
+  return Number(head);
+}
+
 // Telegram limits: sendMessage 4096 chars, sendDocument caption 1024 chars.
 // We chunk below the hard limits to leave headroom for escape-expansion.
 const MESSAGE_CHUNK_LIMIT = 4000;
 const CAPTION_LIMIT = 1024;
-const VALID_SEVERITIES = new Set(['info', 'success', 'warning', 'fatal', 'approval_required']);
-const DEFAULT_QUICK_ACTIONS = [
-  { text: 'Tiếp tục', action: 'continue' },
-  { text: 'Sửa lỗi test', action: 'fix_failed_tests' },
-  { text: 'Gửi log', action: 'send_last_log' },
-  { text: 'Dừng', action: 'stop' },
-];
-const DEFAULT_BUTTON_TTL_SECONDS = 24 * 60 * 60;
 
 export function loadEnvFromFile(filePath) {
   const result = {};
@@ -53,32 +89,87 @@ export function parseAdminChatIds(raw) {
     .filter((s) => s.length > 0);
 }
 
-export function getTelegramBotToken(envVars = process.env, fileEnv = {}) {
-  return envVars.REPORT_BOT_TOKEN ||
-    envVars.TELEGRAM_BOT_TOKEN ||
-    envVars.BOT_TOKEN ||
-    fileEnv.REPORT_BOT_TOKEN ||
-    fileEnv.TELEGRAM_BOT_TOKEN ||
-    fileEnv.BOT_TOKEN ||
-    '';
+/**
+ * Append a convo-registry row for one successful send. Caller MUST hold (or
+ * obtain) the lock around its own append+prune block; this helper does both
+ * acquire+release for one append because callers don't otherwise interact
+ * with the registry inside the loop. If the lock can't be acquired within
+ * the retry budget the caller is told (return value `false`) and decides
+ * whether to surface a repair hint.
+ */
+// Record one send into the convo-registry. `convoId` is REQUIRED (resolved
+// from the env chain or --convo by the caller). First use on a given
+// (botId, chatId, convoId) auto-writes the allocation row.
+// Returns the resolved convoId (so the caller can echo it on stdout).
+export async function recordConvoSend({ convoId, messageId, chatId, botId }, registryFile = CONVO_REGISTRY_FILE, lockFile = CONVO_LOCK_FILE) {
+  if (convoId == null) throw new Error('recordConvoSend: convoId is required');
+  const acquired = await acquireConvoLock(lockFile);
+  if (!acquired) return { ok: false, reason: 'lock-timeout' };
+  try {
+    const { rows } = readConvoRows(registryFile);
+    const resolved = convoId;
+    if (!hasAllocationRow(rows, resolved, botId, String(chatId))) {
+      // First send for this convo on this chat — write the allocation row.
+      appendConvoRow(
+        { v: CONVO_SCHEMA_VERSION, convoId: resolved, messageId: resolved, chatId: String(chatId), botId, ts: Date.now() },
+        registryFile,
+      );
+    }
+    if (messageId !== resolved) {
+      // Dedupe against an existing (botId, chatId, messageId) row to avoid
+      // bloating the registry on retried/replayed sends (e.g. after
+      // `import-convo --all` re-runs the recovery sweep).
+      const chatStr = String(chatId);
+      const dup = rows.some((r) =>
+        (typeof r.v !== 'number' || r.v <= CONVO_SCHEMA_VERSION)
+        && r.botId === botId && String(r.chatId) === chatStr && r.messageId === messageId,
+      );
+      if (!dup) {
+        appendConvoRow(
+          { v: CONVO_SCHEMA_VERSION, convoId: resolved, messageId, chatId: String(chatId), botId, ts: Date.now() },
+          registryFile,
+        );
+      }
+    }
+    return { ok: true, convoId: resolved, shouldPrune: rows.length >= CONVO_REGISTRY_CAP };
+  } finally {
+    releaseConvoLock(lockFile);
+  }
 }
 
-export function getTelegramAdminChatRaw(envVars = process.env, fileEnv = {}) {
-  return envVars.TELEGRAM_ADMIN_CHAT_ID ||
-    envVars.TELEGRAM_CHAT_ID ||
-    envVars.CHAT_ID ||
-    fileEnv.TELEGRAM_ADMIN_CHAT_ID ||
-    fileEnv.TELEGRAM_CHAT_ID ||
-    fileEnv.CHAT_ID ||
-    '';
+// Run prune out-of-band: caller drops the recordConvoSend lock first, then we
+// reacquire briefly to do the read+rewrite. Bounds lock-hold time per send to
+// "one append" instead of "one append + full prune".
+async function pruneAfterSend(registryFile = CONVO_REGISTRY_FILE, lockFile = CONVO_LOCK_FILE) {
+  const acquired = await acquireConvoLock(lockFile);
+  if (!acquired) return; // skip silently; next send will retry
+  try { pruneConvoRegistry(registryFile); }
+  catch (e) {
+    console.error(`[send-telegram] convo-registry prune failed (non-fatal): ${e instanceof Error ? e.message : String(e)}`);
+  } finally {
+    releaseConvoLock(lockFile);
+  }
 }
 
-export function appendToSentRegistry(messageId, chatId, registryFile = SENT_REGISTRY_FILE) {
+export function appendToSentRegistry({ messageId, chatId, botId = null, convoId = null, registryFile = SENT_REGISTRY_FILE }) {
   if (!messageId) return;
   const dir = path.dirname(registryFile);
   fs.mkdirSync(dir, { recursive: true });
-  const entry = JSON.stringify({ messageId, chatId, ts: Math.floor(Date.now() / 1000) }) + '\n';
-  fs.appendFileSync(registryFile, entry, 'utf8');
+  const row = { v: 1, messageId, chatId, ts: Math.floor(Date.now() / 1000) };
+  if (botId != null) row.botId = botId;
+  // Persist convoId when known so import-convo can repair env-derived convos
+  // (whose convoId is a UUID-hash and never equals any Telegram messageId).
+  if (convoId != null) row.convoId = convoId;
+  const entry = JSON.stringify(row) + '\n';
+  // Durable append — sent-registry is the recovery source for `import-convo`
+  // when the convo-registry append crashed mid-flight.
+  const fd = fs.openSync(registryFile, 'a');
+  try {
+    fs.writeSync(fd, entry);
+    fs.fsyncSync(fd);
+  } finally {
+    fs.closeSync(fd);
+  }
 }
 
 export function readSentRegistry(registryFile = SENT_REGISTRY_FILE) {
@@ -111,149 +202,29 @@ export async function postReaction(token, chatId, messageId, emoji = '👍') {
   return { ok: res.ok && body?.ok !== false, description: body?.description };
 }
 
-export function parsePositiveInt(value, flagName) {
-  const n = parseInt(value, 10);
-  if (isNaN(n) || String(n) !== String(value).trim() || n <= 0) {
-    throw new Error(`${flagName} must be a positive integer, got: ${value}`);
-  }
-  return n;
-}
-
-export function parseButtonSpec(spec) {
-  const raw = String(spec ?? '').trim();
-  const eq = raw.indexOf('=');
-  if (eq <= 0 || eq === raw.length - 1) {
-    throw new Error(`Button spec must be "Label=action", got: ${spec}`);
-  }
-  const text = raw.slice(0, eq).trim();
-  const action = raw.slice(eq + 1).trim();
-  if (!text) throw new Error(`Button label must not be empty: ${spec}`);
-  if (!/^[a-z][a-z0-9_]{0,40}$/.test(action)) {
-    throw new Error(`Button action must be lowercase snake_case, got: ${action}`);
-  }
-  return { text, action };
-}
-
-export function parseButtonList(raw) {
-  return String(raw ?? '')
-    .split(',')
-    .map((part) => part.trim())
-    .filter(Boolean)
-    .map(parseButtonSpec);
-}
-
-export function createButtonMeta({ now = Math.floor(Date.now() / 1000), ttlSeconds = DEFAULT_BUTTON_TTL_SECONDS, nonce = null, jobId = '' } = {}) {
-  return {
-    nonce: nonce || Math.random().toString(36).slice(2, 8),
-    exp: now + ttlSeconds,
-    jobId: String(jobId || '').trim(),
-  };
-}
-
-export function buildCallbackData(action, meta = {}) {
-  const { nonce, exp, jobId } = createButtonMeta(meta);
-  const base = `rb:v1:${action}:${nonce}:${exp}`;
-  return jobId ? `${base}:${jobId}` : base;
-}
-
-export function buildInlineKeyboard(buttons = [], opts = {}) {
-  if (!buttons.length) return null;
-  const rows = [];
-  for (let i = 0; i < buttons.length; i += 2) {
-    rows.push(buttons.slice(i, i + 2).map((button) => ({
-      text: button.text,
-      callback_data: buildCallbackData(button.action, opts),
-    })));
-  }
-  return { inline_keyboard: rows };
-}
-
 export function parseArgs(argv) {
-  const result = {
-    filePath: null,
-    positional: [],
-    raw: false,
-    plain: false,
-    replyTo: null,
-    react: null,
-    severity: 'warning',
-    silent: false,
-    logTailPath: null,
-    lines: 20,
-    buttons: [],
-    jobId: '',
-    buttonTtl: DEFAULT_BUTTON_TTL_SECONDS,
-  };
+  const result = { filePath: null, positional: [], raw: false, plain: false, replyTo: null, react: null, convo: null };
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
-    if (arg === '--severity') {
+    if (arg === '--convo') {
       const next = argv[i + 1];
-      if (!next) throw new Error('--severity requires a value');
-      if (!VALID_SEVERITIES.has(next)) throw new Error(`--severity must be one of: ${Array.from(VALID_SEVERITIES).join(', ')}`);
-      result.severity = next;
-      i++;
-      continue;
-    }
-    if (arg === '--silent') {
-      result.silent = true;
-      continue;
-    }
-    if (arg === '--log-tail') {
-      const next = argv[i + 1];
-      if (!next) throw new Error('--log-tail requires a file path');
-      result.logTailPath = next;
-      i++;
-      continue;
-    }
-    if (arg === '--lines') {
-      const next = argv[i + 1];
-      if (!next) throw new Error('--lines requires a positive integer');
-      result.lines = parsePositiveInt(next, '--lines');
-      i++;
-      continue;
-    }
-    if (arg === '--quick-actions') {
-      result.buttons.push(...DEFAULT_QUICK_ACTIONS);
-      continue;
-    }
-    if (arg === '--button') {
-      const next = argv[i + 1];
-      if (!next) throw new Error('--button requires "Label=action"');
-      result.buttons.push(parseButtonSpec(next));
-      i++;
-      continue;
-    }
-    if (arg === '--job-id') {
-      const next = argv[i + 1];
-      if (!next) throw new Error('--job-id requires a value');
-      result.jobId = next;
-      i++;
-      continue;
-    }
-    if (arg === '--button-ttl') {
-      const next = argv[i + 1];
-      if (!next) throw new Error('--button-ttl requires seconds');
-      result.buttonTtl = parsePositiveInt(next, '--button-ttl');
-      i++;
-      continue;
-    }
-    if (arg === '--buttons') {
-      const next = argv[i + 1];
-      if (!next) throw new Error('--buttons requires "Label=action,Label=action"');
-      result.buttons.push(...parseButtonList(next));
+      if (!next) throw new Error('--convo requires a positive-integer convoId');
+      result.convo = validateConvoIdString(next.trim());
       i++;
       continue;
     }
     if (arg === '--react') {
       const next = argv[i + 1];
       if (!next) throw new Error('--react requires a message ID argument');
-      result.react = parsePositiveInt(next, '--react');
+      const n = parseInt(next, 10);
+      if (isNaN(n) || String(n) !== next.trim() || n <= 0) throw new Error(`--react must be a positive integer message ID, got: ${next}`);
+      result.react = n;
       i++;
       continue;
     }
-    if (arg === '--file' || arg === '-file' || arg === '--artifact') {
+    if (arg === '--file' || arg === '-file') {
       const next = argv[i + 1];
-      if (!next) throw new Error(`${arg} requires a path argument`);
+      if (!next) throw new Error('--file requires a path argument');
       result.filePath = next;
       i++;
       continue;
@@ -261,15 +232,19 @@ export function parseArgs(argv) {
     if (arg === '--reply-to') {
       const next = argv[i + 1];
       if (!next) throw new Error('--reply-to requires a message ID argument');
-      result.replyTo = parsePositiveInt(next, '--reply-to');
+      const n = parseInt(next, 10);
+      if (isNaN(n) || String(n) !== next.trim() || n <= 0) throw new Error(`--reply-to must be a positive integer message ID, got: ${next}`);
+      result.replyTo = n;
       i++;
       continue;
     }
     if (arg === '--raw' || arg === '--md-raw') { result.raw = true; continue; }
     if (arg === '--plain') { result.plain = true; continue; }
+    // (mutual exclusion validated after the loop so order doesn't matter)
     if (arg.startsWith('--')) throw new Error(`Unknown flag: ${arg}`);
     result.positional.push(arg);
   }
+  if (result.raw && result.plain) throw new Error('--raw and --plain are mutually exclusive');
   return result;
 }
 
@@ -389,6 +364,95 @@ function countUnescapedMarkerInTextTokens(tokens, ch) {
   return n;
 }
 
+// Module-scope to avoid recompilation per call. Matches leading emoji glyphs:
+// - Extended_Pictographic base (covers most "picture" emojis)
+// - Optional Emoji_Modifier (skin tones)
+// - Optional VS-16 (️) on either side of ZWJ sequences
+// - ZWJ-joined continuations (‍ + next pictographic)
+// - Pairs of Regional_Indicator (country flags like 🇻🇳)
+// - Keycap sequences (digit/# + ️ + ⃣, e.g. 1️⃣, #️⃣)
+// - Repeated, separated by optional spaces — so "🦊🚀 " all get pulled into the tag
+const LEADING_EMOJI_RE = /^(?:(?:(?:\p{Regional_Indicator}\p{Regional_Indicator})|(?:[\d#*]️?⃣)|(?:\p{Extended_Pictographic}️?\p{Emoji_Modifier}?(?:‍\p{Extended_Pictographic}️?\p{Emoji_Modifier}?)*))\s*)+/u;
+// Telegram MarkdownV2 specials per https://core.telegram.org/bots/api#markdownv2-style
+// (18 chars). Hoisted to module scope to avoid recompile per call.
+const MDV2_ALL_SPECIALS_RE = /[_*\[\]()~`>#+\-=|{}.!\\]/g;
+
+// `shortConvoHash` and `CONVO_HASH_LONG_LEN` now live in `./convo-hash.mjs`
+// (leaf module — no circular dep with `pending-store.mjs`). Re-exported at
+// the top of this file for backward compat with existing callers.
+
+// Long-message and Markdown-parse fallback captions previously used
+// `text.split('\n')[0].slice(0, 100)` — which silently dropped the injected
+// `#c<id>` hashtag when the project code + emoji prefix pushed the hashtag
+// past the 100-char cut. Re-extract the hashtag and guarantee it appears in
+// the caption so document fallbacks remain filterable.
+export function previewLineWithHashtag(text, maxLen = 100) {
+  const firstLine = text.split('\n')[0];
+  if (firstLine.length <= maxLen) return firstLine;
+  // Our hashtags are `#<letter><digits>` per shortConvoHash. The leading
+  // letter is a-j (digit-encoded) or `t` (literal short-id prefix).
+  const m = firstLine.match(/#[a-jt]\d+/);
+  if (!m) return firstLine.slice(0, maxLen);
+  const tail = ` …${m[0]}`;
+  const headBudget = Math.max(0, maxLen - tail.length);
+  return firstLine.slice(0, headBudget) + tail;
+}
+
+/**
+ * Build the outgoing message prefix with project code + clickable convo hashtag.
+ *
+ * Returns the message body to hand to the send pipeline. The hashtag form
+ * `#c<convoId>` carries a leading `c` because Telegram does NOT render purely
+ * numeric `#1234` as a clickable hashtag — at least one letter is required.
+ *
+ * Format:
+ *   With leading emoji + convoId: `[<projectCode>] [<emoji> #c<convoId>] <rest>`
+ *   No leading emoji + convoId:   `[<projectCode>] [#c<convoId>] <message>`
+ *   No convoId:                   `[<projectCode>] <message>`  (legacy fallback)
+ *
+ * When convoId is unknown (first send of a brand-new convo without env-derived
+ * id), we fall back to the legacy no-hash format. Subsequent sends in the same
+ * convo will carry the hashtag once the convoId is registered.
+ *
+ * `pretokensEscaped = true` means the caller is in `--raw` mode and has
+ * pre-escaped its `rawMessage` for MarkdownV2; in that case we also escape the
+ * MdV2-special characters (`[`, `]`, `#`) in the injected prefix so Telegram's
+ * parser doesn't reject the message. The leading `c` of `#c<id>` is plain text
+ * and needs no escape; only the `#` character itself is special.
+ */
+export function injectConvoHash(rawMessage, projectCode, convoId, { pretokensEscaped = false } = {}) {
+  // Empty message stays empty UNLESS we have a convoId to surface — document
+  // sends with no caption still need a clickable hashtag so admins can filter.
+  if (rawMessage == null) return rawMessage;
+  if (rawMessage === '' && convoId == null) return rawMessage;
+  // Strip line separators from projectCode: POSIX allows newlines in directory
+  // names, and our `[Project]` prefix MUST be a single line so the hashtag
+  // stays on line 1 (where Telegram entity-detects it). Covers CR, LF, NEL,
+  // and Unicode line/paragraph separators.
+  if (projectCode) projectCode = String(projectCode).replace(/[\r\n\u0085\u2028\u2029]/g, '');
+  // In raw mode the caller has pre-escaped its message for MarkdownV2; we must
+  // escape EVERY MdV2-special char in OUR injected prefix or Telegram rejects
+  // the message with a parse error. Telegram lists 18 special chars; we apply
+  // them to projectCode (which may include `.`, `-`, `_` via cwd basename) and
+  // to our `[`, `]`, `#` syntax.
+  const esc = (s) => (pretokensEscaped ? s.replace(MDV2_ALL_SPECIALS_RE, (m) => '\\' + m) : s);
+  const projectPart = projectCode ? esc(`[${projectCode}] `) : '';
+  if (convoId == null) return projectPart + rawMessage;
+  const hash = `#${shortConvoHash(convoId)}`;
+  // Empty body: emit tag with no trailing space (document caption fallback).
+  if (rawMessage === '') {
+    const head = projectPart ? projectPart.replace(/ $/, '') : '';
+    return head ? `${head} ${esc(`[${hash}]`)}` : esc(`[${hash}]`);
+  }
+  const m = rawMessage.match(LEADING_EMOJI_RE);
+  if (m) {
+    const emoji = m[0].trim();
+    const rest = rawMessage.slice(m[0].length);
+    return `${projectPart}${esc(`[${emoji} ${hash}] `)}${rest}`;
+  }
+  return `${projectPart}${esc(`[${hash}] `)}${rawMessage}`;
+}
+
 export function escapeMarkdownV2(text) {
   // Tokenize first, then apply CommonMark fixups only to text tokens (and link
   // labels). This prevents fenced code blocks / inline code / URLs from being
@@ -450,31 +514,6 @@ export function scrubToken(text, token) {
   return text.split(token).join('***');
 }
 
-export function shouldDisableNotification({ severity = 'warning', silent = false } = {}) {
-  return Boolean(silent || severity === 'info' || severity === 'success');
-}
-
-export function applySeverityMention(text, { severity = 'warning', fatalMention = '' } = {}) {
-  const mention = String(fatalMention || '').trim();
-  if (severity !== 'fatal' || !mention) return text;
-  if (text.startsWith(mention)) return text;
-  return `${mention}\n${text}`;
-}
-
-export function readLogTail(filePath, lines = 20) {
-  const raw = fs.readFileSync(filePath, 'utf8');
-  const allLines = raw.split(/\r?\n/);
-  if (allLines.length > 0 && allLines[allLines.length - 1] === '') allLines.pop();
-  const selected = allLines.slice(-lines).join('\n').trim();
-  return selected || '(log trống)';
-}
-
-export function appendLogTail(message, filePath, lines = 20) {
-  const tail = readLogTail(filePath, lines);
-  const prefix = message ? `${message}\n\n` : '';
-  return `${prefix}Log tail (${lines} dòng):\n\`\`\`\n${tail}\n\`\`\``;
-}
-
 export function buildTempMarkdownFileName(now = new Date(), pid = process.pid) {
   const stamp = now.toISOString().replace(/[:.]/g, '-');
   return `telegram-report-${stamp}-${pid}.md`;
@@ -492,11 +531,10 @@ export function createTempMarkdownFile(content, tmpDir = os.tmpdir()) {
   return filePath;
 }
 
-async function postSendMessage(token, chatId, text, parseMode, replyToMessageId, opts = {}) {
+async function postSendMessage(token, chatId, text, parseMode, replyToMessageId, messageThreadId = null) {
   const payload = { chat_id: chatId, text };
   if (parseMode) payload.parse_mode = parseMode;
-  if (opts.disableNotification) payload.disable_notification = true;
-  if (opts.replyMarkup) payload.reply_markup = opts.replyMarkup;
+  if (messageThreadId != null) payload.message_thread_id = messageThreadId;
   if (replyToMessageId != null) {
     payload.reply_parameters = { message_id: replyToMessageId, allow_sending_without_reply: true };
   }
@@ -514,11 +552,10 @@ async function postSendMessage(token, chatId, text, parseMode, replyToMessageId,
   };
 }
 
-async function postSendDocument(token, chatId, filePath, caption, parseMode, replyToMessageId, opts = {}) {
+async function postSendDocument(token, chatId, filePath, caption, parseMode, replyToMessageId, messageThreadId = null) {
   const form = new FormData();
   form.append('chat_id', String(chatId));
-  if (opts.disableNotification) form.append('disable_notification', 'true');
-  if (opts.replyMarkup) form.append('reply_markup', JSON.stringify(opts.replyMarkup));
+  if (messageThreadId != null) form.append('message_thread_id', String(messageThreadId));
   const data = fs.readFileSync(filePath);
   form.append('document', new Blob([data]), path.basename(filePath));
   if (caption) {
@@ -534,13 +571,103 @@ async function postSendDocument(token, chatId, filePath, caption, parseMode, rep
 }
 
 /**
+ * Attempt to create a forum topic. Returns `{ ok, messageThreadId, description }`.
+ * Failure modes we treat as "this chat doesn't support topics":
+ * - HTTP 400 with descriptions like TOPIC_CREATE_DISABLED, FORUM_NOT_ENABLED,
+ *   CHAT_FORUM_REQUIRED, BOT_DOMAIN_INVALID, or any 403 (permission).
+ * Caller wraps the result; non-ok → negative cache + send without thread_id.
+ */
+async function createForumTopic(token, chatId, name) {
+  const payload = { chat_id: chatId, name: String(name).slice(0, 128) };
+  const res = await fetch(`${TELEGRAM_API}${token}/createForumTopic`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+  const body = await res.json().catch(() => ({}));
+  return {
+    ok: res.ok && body?.ok === true,
+    status: res.status,
+    description: body?.description,
+    messageThreadId: body?.result?.message_thread_id ?? null,
+  };
+}
+
+/**
+ * Resolve the `message_thread_id` to use for a (chatId, projectCode) pair.
+ *
+ * Returns `null` if no topic should be used — either silently because the
+ * chat doesn't support topics (negative cache active), or because the API
+ * call to create one failed. All paths are silent: this function never
+ * throws, never logs warnings to user-visible stdout. Topic discovery is
+ * opportunistic; sends always proceed.
+ *
+ * `nowFn` and `topicsFile` are injectable for tests.
+ */
+// Telegram error descriptions / statuses that imply "this chat can never host
+// topics from this bot" (vs. transient errors like 429 / network glitch).
+// Only these set the negative cache; transient errors silently fall back
+// without caching, so the next send retries.
+function isPermanentNoTopicError(res) {
+  if (!res) return true; // fetch itself threw
+  if (res.status === 403) return true; // bot lacks permission
+  const d = String(res.description ?? '');
+  return /CHAT_FORUM_REQUIRED|TOPICS_FORBIDDEN|TOPIC_NOT_MODIFIED|FORUM_NOT_ENABLED|NOT_FORUM|TOPIC_CREATE_DISABLED|chat not found|user is deactivated|bot was kicked|not enough rights/i.test(d);
+}
+
+export async function resolveThreadId({ token, chatId, projectCode, nowFn = Date.now, topicsFile, fetcher = createForumTopic }) {
+  if (!projectCode || projectCode.startsWith('_')) return null;
+  // Best-effort: cache reads/writes must never block sending.
+  let store;
+  try { store = readTopicsStore(topicsFile); } catch { return null; }
+  // 1. Positive cache hit — use immediately.
+  const cached = getThreadId(store, chatId, projectCode);
+  if (cached != null) return cached;
+  // 2. Negative cache still fresh — skip API call.
+  if (isNoTopicSupportFresh(store, chatId, nowFn())) return null;
+  // 3. Try create.
+  let res;
+  try {
+    res = await fetcher(token, chatId, projectCode);
+  } catch {
+    res = null; // fetch threw — treat as permanent
+  }
+  if (res && res.ok && res.messageThreadId != null) {
+    // Locked RMW so we don't clobber a sibling process's positive entry.
+    try { updateTopicsStore((s) => recordThreadId(s, chatId, projectCode, res.messageThreadId), topicsFile); } catch {}
+    return res.messageThreadId;
+  }
+  // Transient errors (rate-limit / network) — don't poison the cache, just
+  // skip topic this send. Permanent errors (no permission / forum disabled)
+  // → negative-cache for 1h to avoid hammering Telegram.
+  if (isPermanentNoTopicError(res)) {
+    try { updateTopicsStore((s) => recordNoTopicSupport(s, chatId, nowFn()), topicsFile); } catch {}
+  }
+  return null;
+}
+
+/**
+ * Detect responses that mean "the thread_id we sent no longer exists".
+ * Triggers recovery: clear positive cache for that (chatId, projectCode)
+ * and retry the send without thread_id.
+ */
+export function isTopicGoneError(description) {
+  if (!description) return false;
+  return /MESSAGE_THREAD_NOT_FOUND|TOPIC_DELETED|TOPIC_CLOSED/i.test(description);
+}
+
+export function dropTopicMapping(chatId, projectCode, topicsFile) {
+  // Best-effort: a cache write failure must never block the send retry.
+  try { updateTopicsStore((s) => clearThreadId(s, chatId, projectCode), topicsFile); } catch {}
+}
+
+/**
  * Returns { ok, fallback } — `fallback: true` means Telegram rejected our
  * MarkdownV2 parse and we re-sent the chunk as a temporary `.md` document so
  * the admin still receives the content with its markdown source intact
  * (readable in Telegram's file preview), instead of collapsing to plain text.
  */
-export async function sendTextChunk(token, chatId, rawChunk, opts = {}) {
-  const { raw, plain, replyTo = null } = opts;
+export async function sendTextChunk(token, chatId, rawChunk, { raw, plain, replyTo = null, messageThreadId = null }) {
   // Helper: refuse to claim success if Telegram returned ok with no message_id.
   // The agent relies on the printed messageId to start its reply listener; a
   // silent miss would log a successful send but leave the agent unable to
@@ -551,12 +678,12 @@ export async function sendTextChunk(token, chatId, rawChunk, opts = {}) {
   };
 
   if (plain) {
-    const res = await postSendMessage(token, chatId, rawChunk, null, replyTo, opts);
+    const res = await postSendMessage(token, chatId, rawChunk, null, replyTo, messageThreadId);
     if (res.ok) return { ok: true, fallback: false, messageId: assertMessageId(res, 'plain send') };
     throw new Error(res.description ?? `HTTP ${res.status}`);
   }
   const payload = raw ? rawChunk : escapeMarkdownV2(rawChunk);
-  const first = await postSendMessage(token, chatId, payload, 'MarkdownV2', replyTo, opts);
+  const first = await postSendMessage(token, chatId, payload, 'MarkdownV2', replyTo, messageThreadId);
   if (first.ok) return { ok: true, fallback: false, messageId: assertMessageId(first, 'markdown send') };
 
   const desc = first.description ?? `HTTP ${first.status}`;
@@ -568,8 +695,8 @@ export async function sendTextChunk(token, chatId, rawChunk, opts = {}) {
       throw new Error(`markdown-file fallback failed to write tmp file: ${e instanceof Error ? e.message : String(e)}`);
     }
     try {
-      const firstLine = rawChunk.split('\n')[0].slice(0, 100);
-      const retry = await postSendDocument(token, chatId, tmpPath, firstLine, null, replyTo, opts);
+      const firstLine = previewLineWithHashtag(rawChunk);
+      const retry = await postSendDocument(token, chatId, tmpPath, firstLine, null, replyTo, messageThreadId);
       if (retry.ok) return { ok: true, fallback: true, messageId: assertMessageId(retry, 'markdown-file fallback') };
       throw new Error(`markdown-file fallback upload failed: ${retry.description ?? `HTTP ${retry.status}`}`);
     } finally {
@@ -600,8 +727,8 @@ async function sendTextToAdmin(token, chatId, text, opts) {
       throw new Error(`long-message file fallback failed to write tmp file: ${e instanceof Error ? e.message : String(e)}`);
     }
     try {
-      const firstLine = text.split('\n')[0].slice(0, 100);
-      const res = await postSendDocument(token, chatId, tmpPath, firstLine, null, opts.replyTo ?? null, opts);
+      const firstLine = previewLineWithHashtag(text);
+      const res = await postSendDocument(token, chatId, tmpPath, firstLine, null, opts.replyTo ?? null, opts.messageThreadId ?? null);
       if (!res.ok) throw new Error(`long-message file fallback upload failed: ${res.description ?? `HTTP ${res.status}`}`);
       if (!res.messageId) throw new Error(`long-message file fallback: Telegram returned ok but no message_id — refusing to claim success`);
       return {
@@ -638,12 +765,13 @@ async function sendDocumentToAdmin(token, chatId, filePath, caption, opts) {
       parseMode = 'MarkdownV2';
     }
   }
-  const first = await postSendDocument(token, chatId, filePath, finalCaption, parseMode, opts.replyTo, opts);
+  const thread = opts.messageThreadId ?? null;
+  const first = await postSendDocument(token, chatId, filePath, finalCaption, parseMode, opts.replyTo, thread);
   if (first.ok) return { fallback: false, messageId: first.messageId };
 
   const desc = first.description ?? `HTTP ${first.status}`;
   if (parseMode && /can't parse entities|can\u2019t parse entities/i.test(desc)) {
-    const retry = await postSendDocument(token, chatId, filePath, caption.slice(0, CAPTION_LIMIT), null, opts.replyTo, opts);
+    const retry = await postSendDocument(token, chatId, filePath, caption.slice(0, CAPTION_LIMIT), null, opts.replyTo, thread);
     if (retry.ok) return { fallback: true, messageId: retry.messageId };
     throw new Error(retry.description ?? `HTTP ${retry.status}`);
   }
@@ -652,21 +780,23 @@ async function sendDocumentToAdmin(token, chatId, filePath, caption, opts) {
 
 async function main() {
   const envFromFile = loadEnvFromFile(ENV_FILE);
-  const token = getTelegramBotToken(process.env, envFromFile);
+  const token = process.env.REPORT_BOT_TOKEN || envFromFile.REPORT_BOT_TOKEN;
   // Project code: TELE_PROJECT_CODE env override > basename(cwd). No project-local .env reading.
   const projectCode =
     process.env.TELE_PROJECT_CODE ||
     process.env.REPORT_BOT_PROJECT_CODE ||
     path.basename(process.cwd()) ||
     '';
-  const adminIds = parseAdminChatIds(getTelegramAdminChatRaw(process.env, envFromFile));
+  const adminIds = parseAdminChatIds(
+    process.env.TELEGRAM_ADMIN_CHAT_ID || envFromFile.TELEGRAM_ADMIN_CHAT_ID,
+  );
 
   if (!token) {
-    console.error('Missing REPORT_BOT_TOKEN / TELEGRAM_BOT_TOKEN in .env or process env.');
+    console.error('Missing REPORT_BOT_TOKEN in .env or process env.');
     process.exit(1);
   }
   if (adminIds.length === 0) {
-    console.error('Missing TELEGRAM_ADMIN_CHAT_ID / TELEGRAM_CHAT_ID in .env or process env.');
+    console.error('Missing TELEGRAM_ADMIN_CHAT_ID in .env or process env.');
     process.exit(1);
   }
 
@@ -678,18 +808,31 @@ async function main() {
     process.exit(1);
   }
 
-  const opts = {
-    raw: args.raw,
-    plain: args.plain,
-    replyTo: args.replyTo,
-    severity: args.severity,
-    disableNotification: shouldDisableNotification({ severity: args.severity, silent: args.silent }),
-    replyMarkup: buildInlineKeyboard(args.buttons, { ttlSeconds: args.buttonTtl, jobId: args.jobId }),
-  };
+  const botId = extractBotId(token);
+  let effectiveAdminIds = adminIds;
+
+  // Pre-resolve from env > --convo. Null = defer to --reply-to inference
+  // (in maybeRecordConvo) which falls back to "new convo = this messageId".
+  let preResolved = null;
+  try {
+    const r = resolveConvoIdFromEnv({ argConvo: typeof args.convo === 'number' ? args.convo : null });
+    preResolved = r.convoId;
+  } catch (e) {
+    console.error(`[send-telegram] ${e instanceof Error ? e.message : String(e)}`);
+    process.exit(1);
+  }
+  // No pre-flight: passing `--convo <N>` auto-allocates on first use and
+  // appends on subsequent uses. We address every admin chat; the chats that
+  // already have an allocation row will get an append, the ones that don't
+  // will get an allocation. Anti-hijack rule (the strict "must already exist"
+  // check) was dropped per user request — agents are responsible for picking
+  // collision-resistant convoIds (e.g. process pid + timestamp).
+
+  const opts = { raw: args.raw, plain: args.plain, replyTo: args.replyTo };
 
   if (args.react != null) {
     let failures = 0;
-    for (const chatId of adminIds) {
+    for (const chatId of effectiveAdminIds) {
       try {
         const { ok, description } = await postReaction(token, chatId, args.react);
         if (ok) console.log(`[send-telegram] reacted 👍 to ${args.react} in ${chatId}`);
@@ -700,7 +843,7 @@ async function main() {
         console.error(`[send-telegram] react failed for ${chatId}: ${scrubToken(raw, token)}`);
       }
     }
-    if (failures === adminIds.length) process.exit(1);
+    if (failures === effectiveAdminIds.length) process.exit(1);
     return;
   }
 
@@ -711,68 +854,105 @@ async function main() {
     }
     const captionFromArgs = args.positional.join('\n').trim();
     const captionFromStdin = captionFromArgs ? '' : readStdinIfPiped().trim();
-    let rawCaption = captionFromArgs || captionFromStdin || '';
-    if (args.logTailPath) rawCaption = appendLogTail(rawCaption, args.logTailPath, args.lines);
-    rawCaption = applySeverityMention(rawCaption, {
-      severity: args.severity,
-      fatalMention: process.env.TELEGRAM_FATAL_MENTION || envFromFile.TELEGRAM_FATAL_MENTION,
-    });
-    const caption = projectCode && rawCaption ? `[${projectCode}] ${rawCaption}` : rawCaption;
+    const rawCaption = captionFromArgs || captionFromStdin || '';
+    // Caption is built per-chat below because convoId (used in hashtag) is
+    // resolved per-chat in the multi-admin fan-out.
 
     let failures = 0;
-    for (const chatId of adminIds) {
+    let lastConvoId = null;
+    for (const chatId of effectiveAdminIds) {
       try {
-        const { fallback, messageId } = await sendDocumentToAdmin(token, chatId, args.filePath, caption, opts);
-        appendToSentRegistry(messageId, chatId);
+        let convoIdForSend = resolveConvoIdPreSend({ preResolved, replyTo: args.replyTo, chatId, botId });
+        const caption = injectConvoHash(rawCaption, projectCode, convoIdForSend, { pretokensEscaped: opts.raw });
+        const threadId = await resolveThreadId({ token, chatId, projectCode });
+        let sendOpts = { ...opts, messageThreadId: threadId };
+        let result;
+        try {
+          result = await sendDocumentToAdmin(token, chatId, args.filePath, caption, sendOpts);
+        } catch (e) {
+          if (threadId != null && isTopicGoneError(e instanceof Error ? e.message : String(e))) {
+            dropTopicMapping(chatId, projectCode);
+            sendOpts = { ...opts, messageThreadId: null };
+            result = await sendDocumentToAdmin(token, chatId, args.filePath, caption, sendOpts);
+          } else { throw e; }
+        }
+        const { fallback, messageId } = result;
+        if (convoIdForSend == null) convoIdForSend = messageId; // new convo
+        // Sent-registry is durable + load-bearing (lookupConvoIdByMessageId
+        // depends on it). Pending-store is opportunistic. Always durable
+        // first; a phantom pending entry (sent succeeded, pending update
+        // failed) is far less harmful than the inverse (pending listed but
+        // sent-registry has no row → admin reply can't be routed).
+        appendToSentRegistry({ messageId, chatId, botId, convoId: convoIdForSend });
+        try { updatePendingStore((s) => recordBotSend(s, { convoId: convoIdForSend, project: projectCode, messageId })); } catch {}
+        const recordedConvoId = await maybeRecordConvo({ convoId: convoIdForSend, messageId, chatId, botId });
+        if (recordedConvoId != null) lastConvoId = recordedConvoId;
         const parts = [];
         if (fallback) parts.push('caption sent as plain text');
         if (messageId) parts.push(`messageId: ${messageId}`);
         const note = parts.length > 0 ? ` (${parts.join(', ')})` : '';
         console.log(`[send-telegram] document sent to ${chatId}${note}`);
+        emitConvoLine({ convoId: recordedConvoId, messageId });
       } catch (error) {
         failures++;
         const raw = error instanceof Error ? error.message : String(error);
         console.error(`[send-telegram] failed for ${chatId}: ${scrubToken(raw, token)}`);
       }
     }
-    if (failures === adminIds.length) process.exit(1);
-    if (failures < adminIds.length) console.log('[send-telegram] ⚠️ You MUST now start a reply listener (Monitor tool or foreground loop). See telegram-guide.md §Listening for Replies.');
+    if (failures === effectiveAdminIds.length) process.exit(1);
+    if (failures < effectiveAdminIds.length) {
+      console.log(listenerHintForCurrentAgent(lastConvoId));
+    }
     return;
   }
 
   const argText = args.positional.join(' ').trim();
-  let rawMessage = (argText || readStdinIfPiped()).trim();
-  if (args.logTailPath) rawMessage = appendLogTail(rawMessage, args.logTailPath, args.lines);
-  rawMessage = applySeverityMention(rawMessage, {
-    severity: args.severity,
-    fatalMention: process.env.TELEGRAM_FATAL_MENTION || envFromFile.TELEGRAM_FATAL_MENTION,
-  });
-  const message = projectCode && rawMessage ? `[${projectCode}] ${rawMessage}` : rawMessage;
-  if (!message) {
+  const rawMessage = (argText || readStdinIfPiped()).trim();
+  if (!rawMessage) {
     console.error(
-      'Usage:\n' +
-        '  npm run tele -- "<markdown>"\n' +
-        '  npm run tele -- --raw "pre-escaped MdV2"\n' +
-        '  npm run tele -- --plain "no markdown"\n' +
-        '  npm run tele -- --file <path> ["caption"]\n' +
-        '  npm run tele -- --severity fatal --log-tail <path> --lines 20 "failed"\n' +
-        '  npm run tele -- --quick-actions "need decision"\n' +
-        '  cat msg.md | npm run tele',
+      'Usage: node ../teleport/scripts/send-telegram.mjs [args]\n\n' +
+        'args:\n' +
+        '  "<markdown>"            MarkdownV2 message (default)\n' +
+        '  --raw "<text>"          pre-escaped MdV2, no extra escaping\n' +
+        '  --plain "<text>"        plain text, no markdown parsing\n' +
+        '  --file <path> [caption] send file as document\n' +
+        '  (or pipe via stdin)',
     );
     process.exit(1);
   }
 
   let failures = 0;
-  for (const chatId of adminIds) {
+  let lastConvoId = null;
+  for (const chatId of effectiveAdminIds) {
     try {
-      const { fallback, messageId, allMessageIds } = await sendTextToAdmin(token, chatId, message, opts);
-      for (const mid of allMessageIds) appendToSentRegistry(mid, chatId);
+      let convoIdForSend = resolveConvoIdPreSend({ preResolved, replyTo: args.replyTo, chatId, botId });
+      const message = injectConvoHash(rawMessage, projectCode, convoIdForSend, { pretokensEscaped: opts.raw });
+      const threadId = await resolveThreadId({ token, chatId, projectCode });
+      let sendOpts = { ...opts, messageThreadId: threadId };
+      let result;
+      try {
+        result = await sendTextToAdmin(token, chatId, message, sendOpts);
+      } catch (e) {
+        if (threadId != null && isTopicGoneError(e instanceof Error ? e.message : String(e))) {
+          dropTopicMapping(chatId, projectCode);
+          sendOpts = { ...opts, messageThreadId: null };
+          result = await sendTextToAdmin(token, chatId, message, sendOpts);
+        } else { throw e; }
+      }
+      const { fallback, messageId, allMessageIds } = result;
+      if (convoIdForSend == null) convoIdForSend = messageId; // new convo
+      for (const mid of allMessageIds) appendToSentRegistry({ messageId: mid, chatId, botId, convoId: convoIdForSend });
+      // Pending-store after — opportunistic, doesn't block on failure.
+      try { updatePendingStore((s) => recordBotSend(s, { convoId: convoIdForSend, project: projectCode, messageId })); } catch {}
+      const recordedConvoId = await maybeRecordConvo({ convoId: convoIdForSend, messageId, chatId, botId });
+      if (recordedConvoId != null) lastConvoId = recordedConvoId;
       const parts = [];
       if (fallback === 'auto-file') parts.push('long-message → .md file');
       else if (fallback === 'parse-error-file') parts.push('markdown-parse-error → .md file');
       if (messageId) parts.push(`messageId: ${messageId}`);
       const note = parts.length > 0 ? ` (${parts.join(', ')})` : '';
       console.log(`[send-telegram] sent to ${chatId}${note}`);
+      emitConvoLine({ convoId: recordedConvoId, messageId });
     } catch (error) {
       failures++;
       const raw = error instanceof Error ? error.message : String(error);
@@ -780,13 +960,88 @@ async function main() {
     }
   }
 
-  if (failures === adminIds.length) process.exit(1);
-  if (failures < adminIds.length) console.log('[send-telegram] ⚠️ You MUST now start a reply listener (Monitor tool or foreground loop). See telegram-guide.md §Listening for Replies.');
+  if (failures === effectiveAdminIds.length) process.exit(1);
+  if (failures < effectiveAdminIds.length) {
+    console.log(listenerHintForCurrentAgent(lastConvoId));
+  }
+}
+
+// Convo book-keeping helpers used by both the document and text send paths.
+
+// Resolve convoId BEFORE the send so sent-registry can persist it (needed for
+// import-convo to recover env-derived convos whose convoId is a UUID-hash, not
+// a real messageId). Order:
+//   1. preResolved (env or --convo).
+//   2. --reply-to inference: lookup replyTo in registry for this (botId, chatId).
+//   3. null → caller will use messageId as convoId (new convo, post-send).
+export function resolveConvoIdPreSend({ preResolved, replyTo, chatId, botId }) {
+  if (preResolved != null) return preResolved;
+  if (replyTo != null) {
+    const { rows } = readConvoRows();
+    const found = lookupConvoIdByMessageId(rows, botId, String(chatId), replyTo);
+    if (found != null) return found;
+  }
+  return null;
+}
+
+// Record the send into convo-registry. `convoId` is the final value (caller
+// substitutes messageId for new-convo case).
+async function maybeRecordConvo({ convoId, messageId, chatId, botId }) {
+  if (!messageId || convoId == null) return null;
+  const result = await recordConvoSend({ convoId, messageId, chatId, botId });
+  if (result.ok && result.shouldPrune) await pruneAfterSend();
+  if (!result.ok) {
+    // Surface convoId so the operator can repair via import-convo without
+    // having to grep stdout for the env-derived integer.
+    const botSuffix = botId != null ? ` --bot ${botId}` : '';
+    console.error(
+      `[send-telegram] convo-registry lock-timeout (convoId=${convoId}) — registry append SKIPPED for messageId=${messageId}. Run: node import-convo.mjs --convo ${convoId}${botSuffix}`,
+    );
+    return convoId; // still echo so the agent can log + start its listener
+  }
+  return result.convoId;
+}
+
+/**
+ * @internal
+ * Tailor the "now start a listener" reminder by detected agent:
+ * - Claude (`CLAUDE_CODE_SESSION_ID` set) → Monitor tool.
+ * - Other → synchronous `--wait-once` loop.
+ *
+ * `--wait-once` is the operational default for every non-Monitor runtime;
+ * `--watch` remains available in source for manual use.
+ */
+export function listenerHintForCurrentAgent(convoId, env = process.env) {
+  const convoArg = convoId != null ? ` --convo ${convoId}` : '';
+  if (env.CLAUDE_CODE_SESSION_ID) {
+    return `[send-telegram] ⚠️ Start a reply listener via Monitor: \`until node ../teleport/scripts/tele-listen.mjs${convoArg}; do sleep 12; done\``;
+  }
+  const lines = [
+    `[send-telegram] ⚠️ Start a one-reply listener: \`node ../teleport/scripts/tele-listen.mjs --wait-once${convoArg}\``,
+    `[send-telegram] ⚠️ Do NOT end your turn / send a "final" or similar response while waiting for replies.`,
+  ];
+  if (convoId != null) {
+    lines.push(
+      `[send-telegram]    --wait-once exits after \`prompt ready: .../prompt-convo-${convoId}.json\`.`,
+      `[send-telegram]    When the prompt appears: read JSON → reply via send-telegram → delete the JSON → loop.`,
+    );
+  } else {
+    lines.push(
+      `[send-telegram]    (convoId unknown — every send failed; cannot describe the poll path)`,
+    );
+  }
+  return lines.join('\n');
+}
+
+function emitConvoLine({ convoId, messageId }) {
+  if (!messageId || convoId == null) return;
+  console.log(`[send-telegram] convo: ${convoId} messageId: ${messageId} pid: ${process.pid}`);
 }
 
 const isDirectRun = fileURLToPath(import.meta.url) === path.resolve(process.argv[1] ?? '');
 if (isDirectRun) {
-  const tokenForScrub = getTelegramBotToken(process.env, loadEnvFromFile(ENV_FILE));
+  const tokenForScrub =
+    process.env.REPORT_BOT_TOKEN || loadEnvFromFile(ENV_FILE).REPORT_BOT_TOKEN || '';
   main().catch((error) => {
     const raw = error instanceof Error ? error.message : String(error);
     console.error(`[send-telegram] ${scrubToken(raw, tokenForScrub)}`);

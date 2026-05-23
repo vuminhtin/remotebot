@@ -62,9 +62,9 @@ Lệnh này tự động gộp/cập nhật % trên cùng một tin nhắn.
 
 🚨 BẮT BUỘC NGHE PHẢN HỒI (TELE-LISTEN):
 Ngay sau mỗi lần gửi tin nhắn thành công, bạn KHÔNG ĐƯỢC BỎ QUA bước này. Bạn PHẢI lập tức tạo một tác vụ nền (background task) để nghe phản hồi.
-Trên PowerShell, hãy chạy lệnh vòng lặp sau ở background (hoặc dùng công cụ schedule):
+Trên PowerShell, hãy chạy lệnh chờ sau ở background (hoặc dùng công cụ schedule). Bạn phải lấy được $CONVO_ID từ lệnh send trước đó:
 \`\`\`powershell
-while ($true) { node "${listenScript}" --filter-reply-to <IDS> --offset-file "${path.join(offsetDir, '<FIRST>-offset.txt')}"; if ($LASTEXITCODE -eq 0) { break }; Start-Sleep -Seconds 5 }
+node "${listenScript}" --wait-once --convo $CONVO_ID; Start-Sleep -Seconds 5 }
 \`\`\`
 
 🚨 KIỂM DUYỆT LỆNH (INSPECT-COMMAND):
