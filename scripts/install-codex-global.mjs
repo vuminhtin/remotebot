@@ -80,8 +80,6 @@ Quy tắc vận hành:
 - BẮT BUỘC luôn tự động thêm MỘT EMOJI ĐẶC TRƯNG của bạn vào dòng đầu tiên của mọi tin nhắn báo cáo theo đúng định dạng \`<emoji> *<chủ đề>:*\` (ví dụ: \`🌌 *Cập nhật cấu hình:*\`, \`⚛️ *Sửa lỗi:*\`, \`🟧 *Tái cấu trúc:*\`) để người dùng phân biệt. Hệ thống đã tự động gắn tên project nên bạn KHÔNG được tự thêm tên project nữa.
 - Nhận diện trigger ngắn: \`tele\`, \`gửi tele\`, \`📨\`.
 - Nhận diện mode: \`tele mode on\`, \`tele mode off\`.
-- Dùng \`--severity success\` hoặc \`--severity info\` cho cập nhật bình thường để giảm nhiễu.
-- Dùng \`--severity fatal --log-tail <file> --lines 20\` khi có lỗi nghiêm trọng.
 - Nếu cần hướng dẫn chi tiết hơn, đọc \`${guideFile}\`, nhưng luôn dùng đường dẫn tuyệt đối ở trên thay vì giả định \`../remotebot\`.
 ${END}`;
 }
