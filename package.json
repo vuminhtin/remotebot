@@ -8,7 +8,8 @@
     "test": "node --test test/*.test.mjs",
     "package:release": "node scripts/package-release.mjs",
     "install:codex-global": "node scripts/install-codex-global.mjs --apply",
-    "install:windows-shims": "node scripts/install-windows-shims.mjs --apply"
+    "install:windows-shims": "node scripts/install-windows-shims.mjs --apply",
+    "refork-update": "node scripts/refork-update.mjs"
   },
   "engines": {
     "node": ">=20"

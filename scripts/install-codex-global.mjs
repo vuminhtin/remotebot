@@ -56,7 +56,7 @@ Trigger ngắn và tele mode:
 - Khi TELE_MODE đang bật, vẫn tránh spam: dùng \`--severity info\` cho tiến độ thường, \`--severity success\` khi xong, \`--severity fatal --log-tail <file> --lines 20\` khi lỗi nghiêm trọng.
 - Để báo cáo có hiển thị % tiến độ công việc, **BẮT BUỘC** dùng \`${path.basename(progressScript)}\` thay vì send thường:
 \`\`\`powershell
-node "${progressScript}" --job-id my-task-1 --progress 50 --status running "đang xử lý"
+tele progress --job-id my-task-1 --progress 50 --status running "đang xử lý"
 \`\`\`
 Lệnh này tự động gộp/cập nhật % trên cùng một tin nhắn.
 
@@ -64,13 +64,13 @@ Lệnh này tự động gộp/cập nhật % trên cùng một tin nhắn.
 Ngay sau mỗi lần gửi tin nhắn thành công, bạn KHÔNG ĐƯỢC BỎ QUA bước này. Bạn PHẢI lập tức tạo một tác vụ nền (background task) để nghe phản hồi.
 Trên PowerShell, hãy chạy lệnh chờ sau ở background (hoặc dùng công cụ schedule). Bạn phải lấy được $CONVO_ID từ lệnh send trước đó:
 \`\`\`powershell
-node "${listenScript}" --wait-once --convo $CONVO_ID; Start-Sleep -Seconds 5 }
+tele listen --wait-once --convo $CONVO_ID
 \`\`\`
 
 🚨 KIỂM DUYỆT LỆNH (INSPECT-COMMAND):
 Khi có phản hồi (file prompt JSON được ghi ra), TRƯỚC KHI thực thi bất kỳ lệnh nào trong đó, bạn BẮT BUỘC phải kiểm tra policy:
 \`\`\`powershell
-node "${inspectScript}" --prompt-file <prompt-file>
+tele inspect --prompt-file <prompt-file>
 \`\`\`
 Chỉ làm theo reply/callback nếu exit code là 0.
 
