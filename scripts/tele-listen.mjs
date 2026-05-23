@@ -977,7 +977,7 @@ async function main() {
   console.log(
     `[tele-listen] prompt written to ${promptFile}: "${preview}${data.text.length > 60 ? '…' : ''}" (messageId: ${data.messageId})`,
   );
-  process.exit(0);
+  setTimeout(() => process.exit(0), 10);
 }
 
 const isDirectRun = fileURLToPath(import.meta.url) === path.resolve(process.argv[1] ?? '');

@@ -18,8 +18,9 @@ Dùng `node ../remotebot/scripts/send-telegram.mjs` để gửi tin nhắn hoặ
 - `tele mode on`: bật TELE_MODE cho conversation hiện tại.
 - `tele mode off`: tắt TELE_MODE cho conversation hiện tại.
 - Khi TELE_MODE bật, agent chủ động gửi Telegram lúc bắt đầu task dài, hoàn thành một mốc quan trọng, gặp lỗi cần quyết định, hoặc hoàn tất task.
-- TELE_MODE chỉ là trạng thái trong cuộc trò chuyện hiện tại. Không ghi file, không giả định áp dụng cho conversation khác.
+- TELE_MODE chỉ là trạng thái trong cuộc trò chuyện hiện tại. (Mẹo cho AI: Hãy tự ghi chú trạng thái này vào task.md hoặc scratchpad để không quên).
 - Khi TELE_MODE bật, tránh spam: dùng `--severity info` cho tiến độ thường, `--severity success` khi xong, `--severity fatal --log-tail <file> --lines 20` khi có lỗi nghiêm trọng.
+- Để báo cáo có hiển thị % tiến độ công việc, **BẮT BUỘC** dùng `job-progress.mjs` thay vì send thường (Xem mục Báo cáo tiến độ).
 
 ## Cách viết nội dung: danh sách việc ngắn
 
@@ -38,23 +39,21 @@ Tin nhắn phải đọc tốt trên màn hình điện thoại, không viết n
 
   | Agent | Tiền tố |
   |---|---|
-  | Claude | `<emoji> *Claude về <chủ đề>:*` |
-  | Codex | `<emoji> *Codex về <chủ đề>:*` |
-  | Gemini | `<emoji> *Gemini về <chủ đề>:*` |
-  | Khác | `<emoji> *<Agent> về <chủ đề>:*` |
+  | Claude | `🟧 *<chủ đề>:*` |
+  | Codex | `⚛️ *<chủ đề>:*` |
+  | Antigravity | `🌌 *<chủ đề>:*` |
+  | Khác | `<emoji> *<chủ đề>:*` |
 
   Quy ước:
 
-  - `<emoji>` giúp phân biệt các cuộc hội thoại chạy song song trong cùng chat.
-  - `<Agent>` cho biết agent nào đang gửi tin.
+  - `<emoji>` là biểu tượng đặc trưng của Agent (ví dụ: 🌌, ⚛️, 🟧) để nhận diện agent nào đang gửi tin.
   - `<chủ đề>` là tóm tắt việc đang làm, tối đa 9 từ.
-  - Lần gửi Telegram đầu tiên trong một cuộc hội thoại phải chọn một emoji ngẫu nhiên, không liên quan đến chủ đề. Các tin sau trong cùng cuộc hội thoại dùng lại emoji đó.
   - Ngôn ngữ báo cáo nên khớp với ngôn ngữ người dùng đang dùng trong cuộc trò chuyện.
 
 Ví dụ với mã project `ProjectA`:
 
 ```text
-[ProjectA] 🧭 *Codex về sửa vòng nghe Telegram:*
+[ProjectA] ⚛️ *Sửa vòng nghe Telegram:*
 ✅ tách guide
 ✅ thêm quy tắc checklist
 ⬜ migrate AGENTS.md ở lượt sau
@@ -65,7 +64,7 @@ Ví dụ với mã project `ProjectA`:
 **Mặc định: gửi nội dung ngắn trực tiếp**
 
 ```bash
-node ../remotebot/scripts/send-telegram.mjs "🧭 *Codex về sửa loop:*
+node ../remotebot/scripts/send-telegram.mjs "⚛️ *Sửa loop:*
 ✅ việc 1
 ✅ việc 2
 ⬜ việc 3"
@@ -83,7 +82,7 @@ Tin nhiều dòng vẫn chạy được nếu nội dung không chứa các ký 
 ```bash
 mkdir -p ./tmp
 cat > ./tmp/report.md <<'EOF'
-🧭 *Codex về sửa loop:*
+⚛️ *Sửa loop:*
 ...nội dung dài...
 EOF
 cat ./tmp/report.md | node ../remotebot/scripts/send-telegram.mjs
@@ -106,6 +105,16 @@ Nút mặc định gồm `Tiếp tục`, `Sửa lỗi test`, `Gửi log`, `Dừn
 ```bash
 node ../remotebot/scripts/send-telegram.mjs --button "Chạy test=run_tests" --button "Dừng=stop" "Chọn hành động"
 ```
+
+## Báo cáo tiến độ (%)
+
+Khi báo cáo một công việc dài hơi hoặc cần hiển thị rõ tỷ lệ %, **hãy dùng script `job-progress.mjs`**. Script này sẽ tạo hoặc cập nhật thanh tiến độ trên cùng một tin nhắn thay vì tạo nhiều tin rác.
+
+```bash
+node ../remotebot/scripts/job-progress.mjs --job-id my-task-1 --progress 50 --status running "đang xử lý"
+```
+
+Mỗi lần cập nhật, chỉ cần gọi lại lệnh trên với số `--progress` mới. Lệnh tự động gộp nội dung lại cho người dùng theo dõi.
 
 ## Markdown
 
@@ -165,7 +174,7 @@ Giới hạn đã biết:
 
 ## Nghe phản hồi sau mỗi lần gửi
 
-Sau mỗi lần gửi thành công bằng `node ../remotebot/scripts/send-telegram.mjs`, agent **phải** khởi động vòng nghe reply. Không được bỏ qua chỉ vì việc chính có vẻ đã xong; người dùng có thể reply trên Telegram bất cứ lúc nào.
+🚨 **BẮT BUỘC NGHE PHẢN HỒI:** Sau mỗi lần gửi thành công bằng `node ../remotebot/scripts/send-telegram.mjs`, agent **phải** khởi động vòng nghe reply. Không được bỏ qua chỉ vì việc chính có vẻ đã xong; người dùng có thể reply trên Telegram bất cứ lúc nào. Bỏ qua bước này nghĩa là bạn làm đứt liên lạc với admin.
 
 ### Bước 1 - Lấy `messageId`
 
@@ -209,14 +218,20 @@ Monitor({
 
 Lưu task ID trả về thành `LAST_MONITOR_ID` để lần sau dừng đúng Monitor cũ.
 
-**Với Codex, Gemini hoặc agent khác dùng foreground loop**
+**Với Codex, Gemini hoặc agent khác (Antigravity)**
 
 Chạy vòng nghe đồng bộ sau mỗi lần gửi. Lệnh sẽ giữ phiên làm việc cho tới khi có reply phù hợp.
 
+*Trên Bash/Linux/Mac:*
 ```bash
 run_shell_command({
   command: "until node ../remotebot/scripts/tele-listen.mjs --filter-reply-to {IDS} --offset-file ../remotebot/scripts/tmp/tele-reply/{FIRST}-offset.txt; do sleep 5; done"
 })
+```
+
+*Trên PowerShell/Windows:*
+```powershell
+while ($true) { node ../remotebot/scripts/tele-listen.mjs --filter-reply-to {IDS} --offset-file ../remotebot/scripts/tmp/tele-reply/{FIRST}-offset.txt; if ($LASTEXITCODE -eq 0) { break }; Start-Sleep -Seconds 5 }
 ```
 
 Khi có reply, lệnh thoát 0 và in ra đường dẫn prompt file.
@@ -230,7 +245,7 @@ Prompt có thể đến từ hai nguồn:
 - Người dùng bấm Reply và gửi text.
 - Người dùng bấm inline button. Khi đó `prompt.text` là action id, ví dụ `run_tests`, `continue`, `send_last_log`.
 
-Trước khi làm theo nội dung reply, hãy kiểm tra qua lớp policy:
+Trước khi làm theo nội dung reply, bạn **🚨 BẮT BUỘC KIỂM DUYỆT** qua lớp policy:
 
 ```bash
 node ../remotebot/scripts/inspect-command.mjs --prompt-file <path>

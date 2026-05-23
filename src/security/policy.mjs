@@ -25,6 +25,7 @@ export const DEFAULT_POLICY = {
     '\\breboot\\b',
     '\\bformat\\b',
   ],
+  allowUnknownCommands: true,
   auditFile: 'scripts/tmp/remotebot-audit.jsonl',
 };
 
@@ -38,6 +39,7 @@ export function loadPolicy(filePath = 'remotebot.config.json') {
     allowedCommands: parsed.allowedCommands ?? DEFAULT_POLICY.allowedCommands,
     requirePinFor: parsed.requirePinFor ?? DEFAULT_POLICY.requirePinFor,
     dangerousTextPatterns: parsed.dangerousTextPatterns ?? DEFAULT_POLICY.dangerousTextPatterns,
+    allowUnknownCommands: parsed.allowUnknownCommands ?? DEFAULT_POLICY.allowUnknownCommands,
     pinSha256: parsed.pinSha256 ?? DEFAULT_POLICY.pinSha256,
     pinEnvVar: parsed.pinEnvVar ?? DEFAULT_POLICY.pinEnvVar,
   };
@@ -76,6 +78,14 @@ export function evaluateCommand(intent, policy = DEFAULT_POLICY, options = {}) {
   }
 
   if (intent.action === 'unknown') {
+    if (policy.allowUnknownCommands) {
+      return {
+        ...intent,
+        allowedToExecute: true,
+        decision: 'allow',
+        reason: 'Lệnh tự nhiên (unknown) được cho phép để AI tự suy luận.',
+      };
+    }
     return {
       ...intent,
       allowedToExecute: false,

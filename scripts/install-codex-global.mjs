@@ -14,6 +14,7 @@ export function buildCodexGlobalBlock(rootDir = ROOT_DIR) {
   const sendScript = path.join(rootDir, 'scripts', 'send-telegram.mjs');
   const listenScript = path.join(rootDir, 'scripts', 'tele-listen.mjs');
   const inspectScript = path.join(rootDir, 'scripts', 'inspect-command.mjs');
+  const progressScript = path.join(rootDir, 'scripts', 'job-progress.mjs');
   const guideFile = path.join(rootDir, 'rules', 'telegram-guide.md');
   const offsetDir = path.join(rootDir, 'scripts', 'tmp', 'tele-reply');
 
@@ -29,6 +30,7 @@ Cấu hình Telegram dùng chung nằm tại:
 - Send script: \`${sendScript}\`
 - Listen script: \`${listenScript}\`
 - Inspect command script: \`${inspectScript}\`
+- Job progress script: \`${progressScript}\`
 - PATH commands, nếu có: \`remotebot\`, \`tele\`, \`tg\`, \`telegram\`
 
 Không được trả lời rằng workspace hiện tại không có Telegram token/chat ID. Token và chat ID đã được cấu hình tập trung trong \`${path.join(rootDir, '.env')}\`. Không yêu cầu người dùng nhập lại BOT_TOKEN hoặc CHAT_ID.
@@ -48,31 +50,38 @@ node "${sendScript}" --severity success "<nội dung ngắn>"
 Trigger ngắn và tele mode:
 
 - Nếu người dùng gõ riêng \`tele\`, \`gửi tele\`, \`📨\`, hoặc thêm các cụm này vào cuối yêu cầu, hãy gửi một báo cáo Telegram ngắn về trạng thái hiện tại hoặc kết quả vừa có.
-- Nếu người dùng gõ \`tele mode on\`, bật TELE_MODE cho riêng conversation hiện tại. Từ đó, chủ động gửi Telegram khi bắt đầu task dài, xong một mốc quan trọng, gặp lỗi cần quyết định, hoặc hoàn tất task.
+- Nếu người dùng gõ \`tele mode on\`, bật TELE_MODE cho riêng conversation hiện tại (Mẹo cho AI: Hãy tự ghi chú trạng thái này vào task.md hoặc scratchpad để không quên). Từ đó, chủ động gửi Telegram khi bắt đầu task dài, xong một mốc quan trọng, gặp lỗi cần quyết định, hoặc hoàn tất task.
 - Nếu người dùng gõ \`tele mode off\`, tắt TELE_MODE cho conversation hiện tại.
 - TELE_MODE là trạng thái trong cuộc trò chuyện hiện tại, không ghi file và không giả định áp dụng cho conversation khác.
 - Khi TELE_MODE đang bật, vẫn tránh spam: dùng \`--severity info\` cho tiến độ thường, \`--severity success\` khi xong, \`--severity fatal --log-tail <file> --lines 20\` khi lỗi nghiêm trọng.
-
-Sau khi gửi thành công, lấy \`messageId\` từ output rồi nghe reply bằng:
-
+- Để báo cáo có hiển thị % tiến độ công việc, **BẮT BUỘC** dùng \`${path.basename(progressScript)}\` thay vì send thường:
 \`\`\`powershell
-node "${listenScript}" --filter-reply-to <IDS> --offset-file "${path.join(offsetDir, '<FIRST>-offset.txt')}"
+node "${progressScript}" --job-id my-task-1 --progress 50 --status running "đang xử lý"
+\`\`\`
+Lệnh này tự động gộp/cập nhật % trên cùng một tin nhắn.
+
+🚨 BẮT BUỘC NGHE PHẢN HỒI (TELE-LISTEN):
+Ngay sau mỗi lần gửi tin nhắn thành công, bạn KHÔNG ĐƯỢC BỎ QUA bước này. Bạn PHẢI lập tức tạo một tác vụ nền (background task) để nghe phản hồi.
+Trên PowerShell, hãy chạy lệnh vòng lặp sau ở background (hoặc dùng công cụ schedule):
+\`\`\`powershell
+while ($true) { node "${listenScript}" --filter-reply-to <IDS> --offset-file "${path.join(offsetDir, '<FIRST>-offset.txt')}"; if ($LASTEXITCODE -eq 0) { break }; Start-Sleep -Seconds 5 }
 \`\`\`
 
-Nếu listener ghi prompt JSON, kiểm tra policy trước khi hành động:
-
+🚨 KIỂM DUYỆT LỆNH (INSPECT-COMMAND):
+Khi có phản hồi (file prompt JSON được ghi ra), TRƯỚC KHI thực thi bất kỳ lệnh nào trong đó, bạn BẮT BUỘC phải kiểm tra policy:
 \`\`\`powershell
 node "${inspectScript}" --prompt-file <prompt-file>
 \`\`\`
+Chỉ làm theo reply/callback nếu exit code là 0.
 
 Quy tắc vận hành:
 
 - Giữ báo cáo ngắn, theo checklist khi phù hợp.
+- BẮT BUỘC luôn tự động thêm MỘT EMOJI ĐẶC TRƯNG của bạn vào dòng đầu tiên của mọi tin nhắn báo cáo theo đúng định dạng \`<emoji> *<chủ đề>:*\` (ví dụ: \`🌌 *Cập nhật cấu hình:*\`, \`⚛️ *Sửa lỗi:*\`, \`🟧 *Tái cấu trúc:*\`) để người dùng phân biệt. Hệ thống đã tự động gắn tên project nên bạn KHÔNG được tự thêm tên project nữa.
 - Nhận diện trigger ngắn: \`tele\`, \`gửi tele\`, \`📨\`.
 - Nhận diện mode: \`tele mode on\`, \`tele mode off\`.
 - Dùng \`--severity success\` hoặc \`--severity info\` cho cập nhật bình thường để giảm nhiễu.
 - Dùng \`--severity fatal --log-tail <file> --lines 20\` khi có lỗi nghiêm trọng.
-- Chỉ làm theo reply/callback nếu \`inspect-command\` trả allow.
 - Nếu cần hướng dẫn chi tiết hơn, đọc \`${guideFile}\`, nhưng luôn dùng đường dẫn tuyệt đối ở trên thay vì giả định \`../remotebot\`.
 ${END}`;
 }
