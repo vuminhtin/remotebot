@@ -14,20 +14,13 @@ try {
 }
 execSync('git fetch upstream', { cwd: ROOT_DIR, stdio: 'inherit' });
 
-console.log('\n2. Overwriting core files with upstream versions...');
-// We checkout the specific files we want to upgrade to avoid merge conflicts with our custom files
-const filesToUpdate = [
-  'scripts/send-telegram.mjs',
-  'scripts/tele-listen.mjs',
-  'scripts/convo-*.mjs',
-  'scripts/topics-*.mjs',
-  'scripts/pending-*.mjs',
-  'rules/telegram-guide.md',
-];
+console.log('\n2. Merging core files with upstream history...');
 try {
-  execSync(`git checkout upstream/main -- ${filesToUpdate.join(' ')}`, { cwd: ROOT_DIR, stdio: 'inherit' });
+  // Use git merge with -X theirs to properly link git histories (resolving the "57 commits behind" issue on GitHub)
+  // while automatically favoring upstream's logic for any conflicting files.
+  execSync('git merge upstream/main -X theirs --no-commit', { cwd: ROOT_DIR, stdio: 'inherit' });
 } catch (e) {
-  console.error('Failed to checkout files from upstream. Make sure upstream/main has these files.');
+  console.error('Failed to merge files from upstream. Please resolve manually.');
   process.exit(1);
 }
 

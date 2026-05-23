@@ -11,26 +11,29 @@ Forked from `thith/teleport` and customized for `vuminhtin`'s own workflow.
 ### 1. Clone cạnh các project của bạn
 
 ```bash
-cd ~/Projects
-git clone https://github.com/vuminhtin/remotebot.git
-cd remotebot
+cd ~/Projects   # any parent folder works (e.g. ~/work, ~/code, D:\dev)
+git clone https://github.com/thith/teleport.git
+cd teleport
 cp .env.example .env
 ```
 
 Thư mục `remotebot/` nên nằm cùng cấp với các project cần dùng:
 
-```text
-~/Projects/
-├── remotebot/
+```
+<your-parent-folder>/   # e.g. ~/Projects, ~/work, D:\dev
+├── teleport/
 ├── ProjectA/
 └── ProjectB/
 ```
 
-### 2. Lấy bot token và chat ID
+The parent folder name doesn't matter — what matters is that `teleport/` is a **sibling** of your projects.
 
-- **Bot token:** mở [@BotFather](https://t.me/BotFather) trên Telegram -> `/newbot` -> làm theo hướng dẫn -> copy token.
-- **Chat ID cá nhân:** mở [@userinfobot](https://t.me/userinfobot) -> bấm *Start* -> copy ID dạng số.
-- **Nhóm làm việc:** tạo group, thêm bot + người cần nhận tin + [@RawDataBot](https://t.me/RawDataBot) -> RawDataBot sẽ in ra group ID, thường là số âm -> xóa RawDataBot khỏi group sau khi lấy ID.
+### 2. Get a bot token and your chat ID
+
+- **Bot token:** open [@BotFather](https://t.me/BotFather) on Telegram → `/newbot` → follow prompts → copy the token.
+- **Personal chat ID:** open [@userinfobot](https://t.me/userinfobot) → press *Start* → copy your numeric ID.
+- **For a team group chat:** create a group, add your bot + people + [@RawDataBot](https://t.me/RawDataBot) → RawDataBot instantly prints the group ID (a negative number) → remove RawDataBot when done.
+- **(Optional) Multiple projects → enable Topics:** if you'll run teleport from more than one project, enable forum topics so each project lands in its own thread. In [@BotFather](https://t.me/BotFather): `/mybots` → select your bot → `Bot Settings` → `Topics` → *Enable*. Teleport auto-creates one topic per project (named after the cwd basename) on first send. No further setup; if Topics stays off, sends still work and just share one thread.
 
 ### 3. Điền `.env`
 
@@ -56,9 +59,7 @@ Nếu script tìm thấy đúng chat, nó sẽ tự ghi `TELEGRAM_ADMIN_CHAT_ID`
 
 Sau đó kiểm tra gửi thử:
 
-```bash
-node scripts/send-telegram.mjs "hello from remotebot"
-```
+Open Claude Code, Codex, or Gemini CLI **inside any project sibling of `teleport/`** (so `../teleport/` resolves correctly), then paste this prompt — the agent does the rest:
 
 Nếu Telegram nhận được tin nhắn là cấu hình đã đúng. Nếu chưa nhận được, hãy sửa `.env` trước khi cấu hình agent.
 
@@ -100,19 +101,9 @@ Sau đó các phiên Codex mới sẽ dùng chung token/chat ID trong `F:\projec
 
 Khi người dùng yêu cầu gửi báo cáo Telegram, hoặc các biến thể như "send via tele", "tele me", "ping me when done", "gửi tele", "báo cáo qua tele", "tele cho tôi khi xong", "tele", "📨", bạn **phải** đọc `../remotebot/rules/telegram-guide.md` và làm theo. Tra tiền tố nhận diện của bạn trong bảng tiền tố của guide.
 
-Script và guide đặt tập trung tại `../remotebot/`, nằm cùng cấp với mọi project. Mỗi project không giữ bản copy riêng. Cách gọi:
+Scripts + guide are centralized at `../teleport/` (sibling of every project). Each project keeps no local copy. Do **NOT** rely on any invocation details from memory or from this config snippet; the guide is the single source of truth and may change as Teleport is updated.
 
-- Send: `node ../remotebot/scripts/send-telegram.mjs "<message>"` (PROJECT_CODE auto-derived from `basename(cwd)`).
-- Listen: `node ../remotebot/scripts/tele-listen.mjs --filter-reply-to <IDS> --offset-file ../remotebot/scripts/tmp/tele-reply/<offset-file>`.
-
-Sau khi gửi, bạn **phải lập tức** khởi động vòng nghe reply được mô tả trong guide. Lấy `messageId` từ output gửi tin, rồi khởi động Monitor với Claude hoặc foreground loop với Codex/Gemini. **Không được** bỏ qua hoặc để sau, kể cả khi task có vẻ đã xong, vì người dùng có thể reply qua Telegram bất cứ lúc nào.
-
-Trigger ngắn và tele mode:
-
-- `tele`, `gửi tele`, `📨`: gửi một báo cáo Telegram ngắn về trạng thái hiện tại hoặc kết quả vừa có.
-- `tele mode on`: bật TELE_MODE cho conversation hiện tại. Khi bật, chủ động gửi Telegram lúc bắt đầu task dài, xong một mốc quan trọng, gặp lỗi cần quyết định, hoặc hoàn tất task.
-- `tele mode off`: tắt TELE_MODE cho conversation hiện tại.
-- TELE_MODE chỉ là trạng thái trong cuộc trò chuyện hiện tại, không ghi file và không áp dụng sang conversation khác.
+After sending any Telegram message, you **MUST immediately** start the reply-listener flow described in the guide's "Listening for Replies" section. **MUST NOT** skip or defer this step even if the task feels complete — the user may reply via Telegram at any time.
 ````
 
 ## Cách dùng
